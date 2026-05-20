@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ufid-reference"
+version = "0.5.0rc1"
+description = "Reference implementation for the Universal File Identification Database"
+requires-python = ">=3.12,<3.15"
+dependencies = []
+
+[project.optional-dependencies]
+blake3 = [
+    "blake3>=1.0.8",
+]
+postgres = [
+    "psycopg[binary]>=3.2.0",
+]
+archives = [
+    "zstandard>=0.23.0",
+]
+
+[project.scripts]
+ufid = "ufid.cli:main"
+ufid-lookup = "ufid.lookup:main"
+ufid-add = "ufid.add:main"
+ufid-auth = "ufid.auth_cli:main"
+ufid-ia-ingest = "ufid.ia_ingest:main"
+ufid-server = "ufid.server:main"
+ufid-pg-server = "ufid.pg_server:main"
+ufid-local-ia-discovery = "ufid.local_ia_discovery:main"
+ufid-archive-tools = "ufid.archive_tools_setup:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"ufid.web" = ["*.html", "*.css", "*.js", "assets/*.svg"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

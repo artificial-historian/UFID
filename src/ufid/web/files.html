@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>UFID Known Files</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <img src="/assets/ufid-mark.svg" alt="" width="32" height="32">
+        <div>
+          <h1>UFID</h1>
+          <p>Universal File Identification Database</p>
+        </div>
+      </div>
+      <nav class="primary-nav" aria-label="Primary">
+        <a class="nav-link" href="/">Search</a>
+        <a class="nav-link active" href="/files.html">Known Files</a>
+      </nav>
+      <div id="apiStatus" class="status">Checking API</div>
+      <form id="loginForm" class="auth-form">
+        <input id="loginUsername" type="text" autocomplete="username" placeholder="Username">
+        <input id="loginPassword" type="password" autocomplete="current-password" placeholder="Password">
+        <button id="loginButton" type="submit">Log in</button>
+      </form>
+      <div id="sessionPanel" class="session-panel" hidden>
+        <span id="sessionUser"></span>
+        <button id="logoutButton" class="secondary-button" type="button">Log out</button>
+      </div>
+    </header>
+
+    <main class="files-workspace">
+      <section class="panel files-panel" aria-labelledby="filesTitle">
+        <div class="panel-heading files-heading">
+          <div>
+            <h2 id="filesTitle">Known Files</h2>
+            <div id="listState" class="status quiet">Idle</div>
+          </div>
+          <div class="files-toolbar">
+            <label>
+              Filter
+              <input id="fileFilter" type="search" placeholder="UFID, name, size, hash">
+            </label>
+            <button id="refreshButton" type="button">Refresh</button>
+          </div>
+        </div>
+
+        <div class="files-table-shell">
+          <table class="files-table">
+            <thead>
+              <tr>
+                <th>UFID</th>
+                <th>Name</th>
+                <th>Size</th>
+                <th>CRC32</th>
+                <th>MD5</th>
+                <th>SHA1</th>
+                <th>SHA256</th>
+                <th>BLAKE3</th>
+              </tr>
+            </thead>
+            <tbody id="filesTable">
+              <tr>
+                <td colspan="8">No records loaded.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="/files.js" type="module"></script>
+  </body>
+</html>

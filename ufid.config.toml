@@ -1,0 +1,4 @@
+[paths]
+# Runtime databases, logs, caches, downloaded extractor tools, and test scratch
+# data live outside the source tree by default.
+data_dir = "D:/UFID-data"

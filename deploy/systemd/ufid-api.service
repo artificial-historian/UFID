@@ -1,0 +1,22 @@
+[Unit]
+Description=UFID PostgreSQL API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ufid
+Group=ufid
+WorkingDirectory=/opt/ufid/app
+EnvironmentFile=/etc/ufid/ufid-api.env
+ExecStart=/opt/ufid/venv/bin/ufid-pg-server --host ${UFID_API_HOST} --port ${UFID_API_PORT} --web-root ${UFID_WEB_ROOT}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/ufid
+
+[Install]
+WantedBy=multi-user.target

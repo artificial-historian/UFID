@@ -1,0 +1,611 @@
+openapi: 3.1.0
+info:
+  title: UFID API
+  version: 0.5.0rc1
+servers:
+  - url: https://ufid.example.com
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: API is reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+  /api/v1/files/by-hash:
+    get:
+      summary: Search files by hash
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: algorithm
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/HashAlgorithm"
+        - name: value
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Search result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [found]
+                properties:
+                  found:
+                    type: boolean
+                  count:
+                    type: integer
+                  file:
+                    $ref: "#/components/schemas/FileRecord"
+                  files:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FileRecord"
+        "400":
+          $ref: "#/components/responses/Error"
+  /api/v1/files:
+    get:
+      summary: Browse or search file records
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: File page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files, limit, offset, count]
+                properties:
+                  files:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FileRecord"
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+                  count:
+                    type: integer
+                  next_offset:
+                    type:
+                      - integer
+                      - "null"
+    post:
+      summary: Add or enrich a file identity
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FileUpsert"
+      responses:
+        "200":
+          $ref: "#/components/responses/UpsertResult"
+        "201":
+          $ref: "#/components/responses/UpsertResult"
+        "400":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: Identity conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictError"
+  /api/v1/files/{file_id}:
+    get:
+      summary: Load one file record
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: File record
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file:
+                    $ref: "#/components/schemas/FileRecord"
+        "404":
+          $ref: "#/components/responses/Error"
+  /api/v1/files/{file_id}/metadata:
+    post:
+      summary: Add metadata to an existing file
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                metadata:
+                  oneOf:
+                    - type: object
+                      additionalProperties:
+                        type: string
+                    - type: array
+                      items:
+                        $ref: "#/components/schemas/MetadataInput"
+      responses:
+        "200":
+          description: Metadata result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [enriched]
+                properties:
+                  enriched:
+                    type: boolean
+  /api/v1/archive-members:
+    post:
+      summary: Add an archive parent-child relationship
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [parent_file_id]
+              properties:
+                parent_file_id:
+                  type: integer
+                  minimum: 1
+                child_file_id:
+                  type:
+                    - integer
+                    - "null"
+                  minimum: 1
+                archive_path:
+                  type:
+                    - string
+                    - "null"
+      responses:
+        "200":
+          $ref: "#/components/responses/CreatedFlag"
+        "201":
+          $ref: "#/components/responses/CreatedFlag"
+  /api/v1/auth/login:
+    post:
+      summary: Log in and create a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: Login result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authenticated, token, token_type, user]
+                properties:
+                  authenticated:
+                    type: boolean
+                  token:
+                    type: string
+                  token_type:
+                    type: string
+                    enum: [Bearer]
+                  expires_at:
+                    type: string
+                  user:
+                    $ref: "#/components/schemas/AuthUser"
+        "401":
+          $ref: "#/components/responses/Error"
+  /api/v1/auth/session:
+    get:
+      summary: Inspect current session
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Session state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authenticated]
+                properties:
+                  authenticated:
+                    type: boolean
+                  user:
+                    $ref: "#/components/schemas/AuthUser"
+  /api/v1/auth/logout:
+    post:
+      summary: Revoke current session
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Logout result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked:
+                    type: boolean
+  /api/v1/auth/users:
+    post:
+      summary: Create a user
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, roles]
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+                display_name:
+                  type:
+                    - string
+                    - "null"
+                roles:
+                  type: array
+                  items:
+                    type: string
+                    enum: [reader, contributor, curator, admin]
+      responses:
+        "201":
+          description: Created user
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user:
+                    $ref: "#/components/schemas/AuthUser"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: ufid_session
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UpsertResult:
+      description: Upsert result
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [id, created, enriched]
+            properties:
+              id:
+                type: integer
+              created:
+                type: boolean
+              enriched:
+                type: boolean
+    CreatedFlag:
+      description: Created or already existed
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [created]
+            properties:
+              created:
+                type: boolean
+  schemas:
+    HashAlgorithm:
+      type: string
+      enum: [crc32, md5, sha1, sha256, blake3]
+    MetadataType:
+      type: string
+      enum: [text, image, url, json, number, date, binary, other]
+    HashSet:
+      type: object
+      required: [crc32, md5, sha1]
+      properties:
+        crc32:
+          type: string
+          pattern: "^[0-9a-fA-F]{8}$"
+        md5:
+          type: string
+          pattern: "^[0-9a-fA-F]{32}$"
+        sha1:
+          type: string
+          pattern: "^[0-9a-fA-F]{40}$"
+        sha256:
+          type:
+            - string
+            - "null"
+          pattern: "^[0-9a-fA-F]{64}$"
+        blake3:
+          type:
+            - string
+            - "null"
+          pattern: "^[0-9a-fA-F]{64}$"
+    FileUpsert:
+      type: object
+      required: [size_bytes, hashes]
+      properties:
+        display_name:
+          type:
+            - string
+            - "null"
+        size_bytes:
+          type: integer
+          minimum: 0
+        description:
+          type:
+            - string
+            - "null"
+        content_type:
+          type:
+            - string
+            - "null"
+        hashes:
+          $ref: "#/components/schemas/HashSet"
+        metadata:
+          oneOf:
+            - type: object
+              additionalProperties:
+                type: string
+            - type: array
+              items:
+                $ref: "#/components/schemas/MetadataInput"
+    FileRecord:
+      allOf:
+        - type: object
+          required: [id, size_bytes, crc32, md5, sha1, hashes, metadata, archive_members, identity_conflicts]
+          properties:
+            id:
+              type: integer
+            size_bytes:
+              type: integer
+            crc32:
+              type: string
+            md5:
+              type: string
+            sha1:
+              type: string
+            sha256:
+              type:
+                - string
+                - "null"
+            blake3:
+              type:
+                - string
+                - "null"
+            display_name:
+              type:
+                - string
+                - "null"
+            description:
+              type:
+                - string
+                - "null"
+            content_type:
+              type:
+                - string
+                - "null"
+            hashes:
+              $ref: "#/components/schemas/HashSet"
+            metadata:
+              type: array
+              items:
+                $ref: "#/components/schemas/MetadataRecord"
+            archive_members:
+              type: array
+              items:
+                $ref: "#/components/schemas/ArchiveMember"
+            identity_conflicts:
+              type: array
+              items:
+                $ref: "#/components/schemas/IdentityConflict"
+    MetadataInput:
+      type: object
+      required: [metadata_type, name, value]
+      properties:
+        metadata_type:
+          $ref: "#/components/schemas/MetadataType"
+        name:
+          type: string
+        value:
+          type: string
+        notes:
+          type:
+            - string
+            - "null"
+    MetadataRecord:
+      allOf:
+        - $ref: "#/components/schemas/MetadataInput"
+        - type: object
+          required: [id, file_id, added_at]
+          properties:
+            id:
+              type: integer
+            file_id:
+              type: integer
+            added_at:
+              type: string
+    ArchiveMember:
+      type: object
+      required: [id, parent_file_id, child_file_id, archive_path]
+      properties:
+        id:
+          type: integer
+        parent_file_id:
+          type: integer
+        child_file_id:
+          type:
+            - integer
+            - "null"
+        archive_path:
+          type:
+            - string
+            - "null"
+    IdentityConflict:
+      type: object
+      required: [id, file_id, conflict_type, algorithm, incoming_value, incoming_size_bytes, incoming_crc32, incoming_md5, incoming_sha1, logged_at]
+      properties:
+        id:
+          type: integer
+        file_id:
+          type: integer
+        related_file_id:
+          type:
+            - integer
+            - "null"
+        conflict_type:
+          type: string
+          enum: [optional_hash_mismatch, required_hash_overlap]
+        algorithm:
+          $ref: "#/components/schemas/HashAlgorithm"
+        existing_value:
+          type:
+            - string
+            - "null"
+        incoming_value:
+          type: string
+        incoming_size_bytes:
+          type: integer
+        incoming_crc32:
+          type: string
+        incoming_md5:
+          type: string
+        incoming_sha1:
+          type: string
+        notes:
+          type:
+            - string
+            - "null"
+        logged_at:
+          type: string
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    ConflictError:
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            file_id:
+              type: integer
+            conflict_type:
+              type: string
+              enum: [optional_hash_mismatch, required_hash_overlap]
+    AuthUser:
+      type: object
+      required: [id, username, roles]
+      properties:
+        id:
+          type: integer
+        username:
+          type: string
+        display_name:
+          type:
+            - string
+            - "null"
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [reader, contributor, curator, admin]
+        session_id:
+          type:
+            - integer
+            - "null"
+        expires_at:
+          type:
+            - string
+            - "null"

@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>UFID</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <img src="/assets/ufid-mark.svg" alt="" width="32" height="32">
+        <div>
+          <h1>UFID</h1>
+          <p>Universal File Identification Database</p>
+        </div>
+      </div>
+      <nav class="primary-nav" aria-label="Primary">
+        <a class="nav-link active" href="/">Search</a>
+        <a class="nav-link" href="/files.html">Known Files</a>
+      </nav>
+      <div id="apiStatus" class="status">Checking API</div>
+      <form id="loginForm" class="auth-form">
+        <input id="loginUsername" type="text" autocomplete="username" placeholder="Username">
+        <input id="loginPassword" type="password" autocomplete="current-password" placeholder="Password">
+        <button id="loginButton" type="submit">Log in</button>
+      </form>
+      <div id="sessionPanel" class="session-panel" hidden>
+        <span id="sessionUser"></span>
+        <button id="logoutButton" class="secondary-button" type="button">Log out</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel scan-panel" aria-labelledby="scanTitle">
+        <div class="panel-heading">
+          <h2 id="scanTitle">File Search</h2>
+          <button id="resetButton" class="icon-button" type="button" title="Reset">
+            <span aria-hidden="true">R</span>
+          </button>
+        </div>
+
+        <label id="dropZone" class="drop-zone">
+          <input id="fileInput" type="file">
+          <span class="drop-icon" aria-hidden="true"></span>
+          <strong>Drop a file or choose one</strong>
+          <span id="selectedFile">No file selected</span>
+        </label>
+
+        <div class="hash-actions">
+          <button id="searchButton" type="button" disabled>Search UFID</button>
+          <button id="addButton" type="button" disabled>Add / Enrich</button>
+        </div>
+
+        <div class="metadata-grid">
+          <label>
+            Description
+            <input id="descriptionInput" type="text" placeholder="Human-readable description">
+          </label>
+          <label>
+            Content type
+            <input id="contentTypeInput" type="text" placeholder="application/octet-stream">
+          </label>
+        </div>
+
+        <div class="metadata-builder">
+          <div class="subheading-row">
+            <h3>Additional Metadata</h3>
+            <button id="addMetadataButton" type="button">Add Metadata</button>
+          </div>
+          <div class="metadata-grid">
+            <label>
+              Type
+              <select id="metadataTypeInput">
+                <option value="text">text</option>
+                <option value="image">image</option>
+                <option value="url">url</option>
+                <option value="json">json</option>
+                <option value="number">number</option>
+                <option value="date">date</option>
+                <option value="binary">binary</option>
+                <option value="other">other</option>
+              </select>
+            </label>
+            <label>
+              Name
+              <input id="metadataNameInput" type="text" placeholder="vendor">
+            </label>
+            <label class="metadata-wide">
+              Value
+              <textarea id="metadataValueInput" rows="3" placeholder="Acme"></textarea>
+            </label>
+            <label class="metadata-wide">
+              Notes
+              <input id="metadataNotesInput" type="text" placeholder="Source, confidence, or context">
+            </label>
+          </div>
+          <div id="metadataDraftList" class="metadata-draft-list">
+            <p>No extra metadata staged.</p>
+          </div>
+        </div>
+
+        <h3>Computed Hashes</h3>
+        <div class="hash-table-shell">
+          <table>
+            <thead>
+              <tr>
+                <th>Algorithm</th>
+                <th>Value</th>
+              </tr>
+            </thead>
+            <tbody id="hashTable">
+              <tr>
+                <td colspan="2">Select a file to compute browser-supported hashes.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel result-panel" aria-labelledby="resultTitle">
+        <div class="panel-heading">
+          <h2 id="resultTitle">UFID Record</h2>
+          <div id="recordState" class="status quiet">Idle</div>
+        </div>
+
+        <form id="manualLookup" class="manual-lookup">
+          <label>
+            Algorithm
+            <select id="manualAlgorithm">
+              <option value="sha256">sha256</option>
+              <option value="blake3">blake3</option>
+              <option value="sha1">sha1</option>
+              <option value="md5">md5</option>
+              <option value="crc32">crc32</option>
+            </select>
+          </label>
+          <label>
+            Hash
+            <input id="manualHash" type="text" autocomplete="off" spellcheck="false">
+          </label>
+          <button type="submit">Lookup</button>
+        </form>
+
+        <div class="browse-toolbar">
+          <label>
+            Browse
+            <input id="browseQuery" type="search" placeholder="Search names, descriptions, metadata, hashes">
+          </label>
+          <button id="browseButton" type="button">Refresh</button>
+        </div>
+
+        <div id="browseResults" class="browse-results">
+          <p>No records loaded.</p>
+        </div>
+
+        <div id="recordDetails" class="record-details">
+          <p>No record loaded.</p>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
