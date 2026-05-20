@@ -4,9 +4,17 @@ const HASH_COLUMNS = ["crc32", "md5", "sha1", "sha256", "blake3"];
 const state = {
   user: null,
   files: [],
-  filteredFiles: [],
   loading: false,
+  page: 1,
+  pageSize: PAGE_LIMIT,
+  totalCount: 0,
+  sortKey: "id",
+  sortDirection: "desc",
+  filter: "",
+  requestId: 0,
 };
+
+let filterTimer = null;
 
 const apiStatus = document.querySelector("#apiStatus");
 const fileFilter = document.querySelector("#fileFilter");
@@ -17,9 +25,15 @@ const loginForm = document.querySelector("#loginForm");
 const loginPassword = document.querySelector("#loginPassword");
 const loginUsername = document.querySelector("#loginUsername");
 const logoutButton = document.querySelector("#logoutButton");
+const nextPageButton = document.querySelector("#nextPageButton");
+const pageInfo = document.querySelector("#pageInfo");
+const pageNumberList = document.querySelector("#pageNumberList");
+const pageSummary = document.querySelector("#pageSummary");
+const previousPageButton = document.querySelector("#previousPageButton");
 const refreshButton = document.querySelector("#refreshButton");
 const sessionPanel = document.querySelector("#sessionPanel");
 const sessionUser = document.querySelector("#sessionUser");
+const sortButtons = [...document.querySelectorAll("[data-sort]")];
 
 checkApi();
 
@@ -37,8 +51,59 @@ refreshButton.addEventListener("click", async () => {
 });
 
 fileFilter.addEventListener("input", () => {
-  applyFilter();
-  renderFiles();
+  state.filter = fileFilter.value.trim();
+  state.page = 1;
+  window.clearTimeout(filterTimer);
+  filterTimer = window.setTimeout(() => {
+    void loadKnownFiles();
+  }, 250);
+});
+
+previousPageButton.addEventListener("click", async () => {
+  await goToPage(state.page - 1);
+});
+
+nextPageButton.addEventListener("click", async () => {
+  await goToPage(state.page + 1);
+});
+
+pageNumberList.addEventListener("click", async (event) => {
+  const button = event.target?.closest?.("[data-page]");
+  if (!button) {
+    return;
+  }
+  await goToPage(Number(button.dataset.page || "1"));
+});
+
+async function goToPage(page) {
+  if (state.loading) {
+    return;
+  }
+  const pages = totalPages();
+  const target = Math.min(Math.max(Math.trunc(page), 1), pages);
+  if (!Number.isFinite(target) || target === state.page) {
+    return;
+  }
+  state.page = target;
+  await loadKnownFiles();
+}
+
+sortButtons.forEach((button) => {
+  button.addEventListener("click", async () => {
+    const key = button.dataset.sort;
+    if (!key || state.loading) {
+      return;
+    }
+    if (state.sortKey === key) {
+      state.sortDirection = state.sortDirection === "asc" ? "desc" : "asc";
+    } else {
+      state.sortKey = key;
+      state.sortDirection = key === "id" ? "desc" : "asc";
+    }
+    state.page = 1;
+    updateSortHeaders();
+    await loadKnownFiles();
+  });
 });
 
 async function checkApi() {
@@ -77,6 +142,7 @@ async function login() {
     }, "Login failed");
     state.user = body.user;
     loginPassword.value = "";
+    state.page = 1;
     renderSession();
     setListState(`Logged in as ${state.user.username}`, "ok");
     await loadKnownFiles();
@@ -99,7 +165,8 @@ async function logout() {
   }
   state.user = null;
   state.files = [];
-  state.filteredFiles = [];
+  state.page = 1;
+  state.totalCount = 0;
   renderSession();
   renderFilesMessage("Log in to view known files.");
   setListState("Logged out", "quiet");
@@ -121,12 +188,17 @@ function renderSession() {
   sessionPanel.hidden = !authenticated;
   refreshButton.disabled = !authenticated || state.loading;
   fileFilter.disabled = !authenticated || state.loading;
+  sortButtons.forEach((button) => {
+    button.disabled = !authenticated || state.loading;
+  });
   if (authenticated) {
     const roles = (state.user.roles || []).join(", ");
     sessionUser.textContent = `${state.user.username}${roles ? ` (${roles})` : ""}`;
   } else {
     sessionUser.textContent = "";
   }
+  renderPagination();
+  updateSortHeaders();
 }
 
 async function loadKnownFiles() {
@@ -136,70 +208,70 @@ async function loadKnownFiles() {
     return;
   }
 
+  const requestId = state.requestId + 1;
+  state.requestId = requestId;
   state.loading = true;
   state.files = [];
-  state.filteredFiles = [];
   renderSession();
   renderFilesMessage("Loading records.");
-  setListState("Loading 0 files", "quiet");
+  setListState("Loading files", "quiet");
 
-  let offset = 0;
+  const offset = (state.page - 1) * state.pageSize;
+  const params = new URLSearchParams({
+    limit: String(state.pageSize),
+    offset: String(offset),
+    sort: state.sortKey,
+    direction: state.sortDirection,
+  });
+  if (state.filter) {
+    params.set("q", state.filter);
+  }
+
   try {
-    while (offset !== null) {
-      const params = new URLSearchParams({
-        limit: String(PAGE_LIMIT),
-        offset: String(offset),
-      });
-      const body = await fetchJson(`/api/v1/files?${params.toString()}`, undefined, "Load failed");
-      const files = body.files || [];
-      state.files.push(...files);
-      setListState(`Loading ${state.files.length} files`, "quiet");
-      if (files.length === 0 || body.next_offset === null) {
-        offset = null;
-      } else {
-        offset = body.next_offset;
-      }
+    const body = await fetchJson(`/api/v1/files?${params.toString()}`, undefined, "Load failed");
+    if (requestId !== state.requestId) {
+      return;
     }
-    applyFilter();
+    state.files = body.files || [];
+    state.totalCount = Number.isFinite(body.total_count) ? body.total_count : state.files.length;
+    if (state.totalCount > 0 && state.files.length === 0 && state.page > totalPages()) {
+      state.page = totalPages();
+      await loadKnownFiles();
+      return;
+    }
     renderFiles();
   } catch (error) {
+    if (requestId !== state.requestId) {
+      return;
+    }
     renderFilesMessage(error.message);
     setListState(error.message, "error");
   } finally {
-    state.loading = false;
-    renderSession();
+    if (requestId === state.requestId) {
+      state.loading = false;
+      renderSession();
+    }
   }
-}
-
-function applyFilter() {
-  const query = fileFilter.value.trim().toLowerCase();
-  if (!query) {
-    state.filteredFiles = [...state.files];
-    return;
-  }
-  state.filteredFiles = state.files.filter((file) => fileSearchText(file).includes(query));
 }
 
 function renderFiles() {
-  const total = state.files.length;
-  const shown = state.filteredFiles.length;
+  const total = state.totalCount;
+  const shown = state.files.length;
   if (!total) {
-    renderFilesMessage("No known files.");
-    setListState("0 files", "quiet");
+    renderFilesMessage(state.filter ? "No matching files." : "No known files.");
+    setListState(state.filter ? "0 matching files" : "0 files", state.filter ? "warn" : "quiet");
     return;
   }
   if (!shown) {
-    renderFilesMessage("No matching files.");
-    setListState(`0 of ${total} files`, "warn");
+    renderFilesMessage("No records on this page.");
+    setListState(`${total} files`, "warn");
     return;
   }
 
-  filesTable.innerHTML = state.filteredFiles.map(renderFileRow).join("");
-  if (shown === total) {
-    setListState(`${total} files`, "ok");
-  } else {
-    setListState(`${shown} of ${total} files`, "ok");
-  }
+  filesTable.innerHTML = state.files.map(renderFileRow).join("");
+  const start = (state.page - 1) * state.pageSize + 1;
+  const end = start + shown - 1;
+  setListState(`${start}-${end} of ${total} files`, "ok");
 }
 
 function renderFileRow(file) {
@@ -219,21 +291,96 @@ function renderFileRow(file) {
 
 function renderFilesMessage(message) {
   filesTable.innerHTML = `<tr><td colspan="8">${escapeHtml(message)}</td></tr>`;
+  renderPagination();
 }
 
-function fileSearchText(file) {
-  const hashes = file.hashes || {};
-  return [
-    file.id,
-    file.display_name,
-    file.content_type,
-    file.description,
-    file.size_bytes,
-    ...HASH_COLUMNS.map((algorithm) => hashes[algorithm]),
-  ]
-    .filter((value) => value !== null && value !== undefined)
-    .join(" ")
-    .toLowerCase();
+function renderPagination() {
+  const pages = totalPages();
+  const authenticated = Boolean(state.user);
+  const total = state.totalCount;
+  const shown = state.files.length;
+  const start = total && shown ? (state.page - 1) * state.pageSize + 1 : 0;
+  const end = total && shown ? start + shown - 1 : 0;
+
+  pageInfo.textContent = `Page ${Math.min(state.page, pages)} of ${pages}`;
+  pageSummary.textContent = total && shown
+    ? `Rows ${start}-${end} of ${total}`
+    : total
+      ? `${total} records`
+      : "No records loaded.";
+  previousPageButton.disabled = !authenticated || state.loading || state.page <= 1;
+  nextPageButton.disabled = !authenticated || state.loading || state.page >= pages;
+  pageNumberList.innerHTML = pageWindow(state.page, pages)
+    .map((item) => renderPageWindowItem(item, authenticated))
+    .join("");
+}
+
+function renderPageWindowItem(item, authenticated) {
+  if (item === "gap") {
+    return `<span class="page-gap" aria-hidden="true">...</span>`;
+  }
+  const current = item === state.page;
+  return `
+    <button
+      class="secondary-button page-number-button${current ? " current-page" : ""}"
+      type="button"
+      data-page="${item}"
+      ${current ? 'aria-current="page"' : ""}
+      ${!authenticated || state.loading || current ? "disabled" : ""}
+    >${item}</button>
+  `;
+}
+
+function pageWindow(currentPage, pageCount) {
+  if (pageCount <= 7) {
+    return Array.from({ length: pageCount }, (_, index) => index + 1);
+  }
+
+  const pages = new Set([1, pageCount]);
+  const start = Math.max(2, currentPage - 2);
+  const end = Math.min(pageCount - 1, currentPage + 2);
+  for (let page = start; page <= end; page += 1) {
+    pages.add(page);
+  }
+
+  const sortedPages = [...pages].sort((a, b) => a - b);
+  const items = [];
+  for (const page of sortedPages) {
+    const previous = items[items.length - 1];
+    if (typeof previous === "number" && page - previous > 1) {
+      items.push("gap");
+    }
+    items.push(page);
+  }
+  return items;
+}
+
+function updateSortHeaders() {
+  sortButtons.forEach((button) => {
+    const key = button.dataset.sort;
+    const sorted = key === state.sortKey;
+    const th = button.closest("th");
+    const indicator = button.querySelector(".sort-indicator");
+    button.setAttribute(
+      "aria-label",
+      sorted
+        ? `Sort by ${button.textContent.trim()} ${state.sortDirection === "asc" ? "descending" : "ascending"}`
+        : `Sort by ${button.textContent.trim()} ascending`,
+    );
+    if (th) {
+      th.setAttribute(
+        "aria-sort",
+        sorted ? (state.sortDirection === "asc" ? "ascending" : "descending") : "none",
+      );
+    }
+    if (indicator) {
+      indicator.textContent = sorted ? (state.sortDirection === "asc" ? " ^" : " v") : "";
+    }
+  });
+}
+
+function totalPages() {
+  return Math.max(1, Math.ceil(state.totalCount / state.pageSize));
 }
 
 function setListState(message, type) {

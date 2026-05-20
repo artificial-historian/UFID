@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import logging
 from pathlib import Path
 import sqlite3
@@ -30,6 +32,30 @@ HASH_HEX_LENGTHS = {
     "sha1": 40,
     "sha256": 64,
     "blake3": 64,
+}
+GOLDRUSH_ALERT_COLUMNS = (
+    "name",
+    "description",
+    "size_bytes",
+    *SUPPORTED_HASH_ALGORITHMS,
+    "source_type",
+    "source_name",
+    "source_detail",
+    "fingerprint",
+)
+FILE_LIST_SORT_COLUMNS = {
+    "id": "f.id",
+    "name": (
+        "COALESCE((SELECT fm.value FROM ufid_file_meta fm "
+        "WHERE fm.file_id = f.id AND fm.name = 'filename' "
+        "ORDER BY fm.added_at, fm.id LIMIT 1), '') COLLATE NOCASE"
+    ),
+    "size": "f.size_bytes",
+    "crc32": "f.crc32",
+    "md5": "f.md5",
+    "sha1": "f.sha1",
+    "sha256": "COALESCE(f.sha256, '')",
+    "blake3": "COALESCE(f.blake3, '')",
 }
 IDENTITY_CONFLICT_TYPES = (
     "optional_hash_mismatch",
@@ -208,6 +234,81 @@ CREATE TABLE IF NOT EXISTS ufid_file_source (
     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (file_id, source_id, external_reference)
 );
+
+CREATE TABLE IF NOT EXISTS ufid_goldrush_alert (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    description TEXT NOT NULL CHECK (length(trim(description)) > 0),
+    size_bytes INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    crc32 TEXT CHECK (
+        crc32 IS NULL OR (
+            length(crc32) = 8
+            AND crc32 = lower(crc32)
+            AND crc32 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    md5 TEXT CHECK (
+        md5 IS NULL OR (
+            length(md5) = 32
+            AND md5 = lower(md5)
+            AND md5 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    sha1 TEXT CHECK (
+        sha1 IS NULL OR (
+            length(sha1) = 40
+            AND sha1 = lower(sha1)
+            AND sha1 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    sha256 TEXT CHECK (
+        sha256 IS NULL OR (
+            length(sha256) = 64
+            AND sha256 = lower(sha256)
+            AND sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    blake3 TEXT CHECK (
+        blake3 IS NULL OR (
+            length(blake3) = 64
+            AND blake3 = lower(blake3)
+            AND blake3 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    source_type TEXT,
+    source_name TEXT,
+    source_detail TEXT,
+    fingerprint TEXT NOT NULL UNIQUE CHECK (length(trim(fingerprint)) > 0),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        crc32 IS NOT NULL
+        OR md5 IS NOT NULL
+        OR sha1 IS NOT NULL
+        OR sha256 IS NOT NULL
+        OR blake3 IS NOT NULL
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_crc32
+ON ufid_goldrush_alert (crc32);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_md5
+ON ufid_goldrush_alert (md5);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_sha1
+ON ufid_goldrush_alert (sha1);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_sha256
+ON ufid_goldrush_alert (sha256);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_blake3
+ON ufid_goldrush_alert (blake3);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_size
+ON ufid_goldrush_alert (size_bytes);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_source
+ON ufid_goldrush_alert (source_name);
 
 CREATE TABLE IF NOT EXISTS ufid_user_account (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -842,81 +943,238 @@ def add_file_metadata(
     return enriched
 
 
+def create_goldrush_alert(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    description: str,
+    hashes: Mapping[str, str | None],
+    size_bytes: int | str | None = None,
+    source_type: str | None = None,
+    source_name: str | None = None,
+    source_detail: str | None = None,
+) -> dict[str, Any]:
+    normalized = _normalize_goldrush_alert(
+        {
+            "name": name,
+            "description": description,
+            "size_bytes": size_bytes,
+            "hashes": hashes,
+            "source_type": source_type,
+            "source_name": source_name,
+            "source_detail": source_detail,
+        }
+    )
+    with connection:
+        created = _insert_goldrush_alert(connection, normalized)
+    alert = _get_goldrush_alert_by_fingerprint(connection, normalized["fingerprint"])
+    assert alert is not None
+    return {"alert": alert, "created": created}
+
+
+def import_goldrush_alerts(
+    connection: sqlite3.Connection,
+    alerts: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    received = list(alerts)
+    normalized_rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for index, alert in enumerate(received):
+        try:
+            normalized_rows.append(_normalize_goldrush_alert(alert))
+        except ValueError as exc:
+            errors.append(
+                {
+                    "index": index,
+                    "name": str(alert.get("name") or ""),
+                    "error": str(exc),
+                }
+            )
+
+    created = 0
+    with connection:
+        for row in normalized_rows:
+            if _insert_goldrush_alert(connection, row):
+                created += 1
+
+    return {
+        "received": len(received),
+        "valid": len(normalized_rows),
+        "created": created,
+        "skipped": len(normalized_rows) - created,
+        "errors": errors,
+    }
+
+
+def list_goldrush_alerts(
+    connection: sqlite3.Connection,
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    query: str | None = None,
+) -> list[dict[str, Any]]:
+    bounded_limit = min(max(limit, 1), 200)
+    bounded_offset = max(offset, 0)
+    where_sql, params = _goldrush_alert_filter(query)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM ufid_goldrush_alert a
+        {where_sql}
+        ORDER BY a.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (*params, bounded_limit, bounded_offset),
+    ).fetchall()
+    return [_goldrush_alert_row(row) for row in rows]
+
+
+def count_goldrush_alerts(
+    connection: sqlite3.Connection,
+    *,
+    query: str | None = None,
+) -> int:
+    where_sql, params = _goldrush_alert_filter(query)
+    row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM ufid_goldrush_alert a
+        {where_sql}
+        """,
+        params,
+    ).fetchone()
+    return int(row["total"] if row is not None else 0)
+
+
+def list_goldrush_matches(
+    connection: sqlite3.Connection,
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    query: str | None = None,
+) -> list[dict[str, Any]]:
+    bounded_limit = min(max(limit, 1), 200)
+    bounded_offset = max(offset, 0)
+    filter_sql, params = _goldrush_match_filter(query)
+    rows = connection.execute(
+        f"""
+        SELECT
+            a.id AS alert_id,
+            a.name AS alert_name,
+            a.description AS alert_description,
+            a.size_bytes AS alert_size_bytes,
+            a.crc32 AS alert_crc32,
+            a.md5 AS alert_md5,
+            a.sha1 AS alert_sha1,
+            a.sha256 AS alert_sha256,
+            a.blake3 AS alert_blake3,
+            a.source_type AS alert_source_type,
+            a.source_name AS alert_source_name,
+            a.source_detail AS alert_source_detail,
+            a.created_at AS alert_created_at,
+            f.id AS file_id,
+            f.size_bytes AS file_size_bytes,
+            f.crc32 AS file_crc32,
+            f.md5 AS file_md5,
+            f.sha1 AS file_sha1,
+            f.sha256 AS file_sha256,
+            f.blake3 AS file_blake3,
+            COALESCE((
+                SELECT fm.value
+                FROM ufid_file_meta fm
+                WHERE fm.file_id = f.id
+                  AND fm.name = 'filename'
+                ORDER BY fm.added_at, fm.id
+                LIMIT 1
+            ), '') AS file_display_name,
+            (
+                SELECT fm.value
+                FROM ufid_file_meta fm
+                WHERE fm.file_id = f.id
+                  AND fm.name = 'content_type'
+                ORDER BY fm.added_at, fm.id
+                LIMIT 1
+            ) AS file_content_type,
+            CASE WHEN a.crc32 IS NOT NULL AND a.crc32 = f.crc32 THEN 1 ELSE 0 END AS matched_crc32,
+            CASE WHEN a.md5 IS NOT NULL AND a.md5 = f.md5 THEN 1 ELSE 0 END AS matched_md5,
+            CASE WHEN a.sha1 IS NOT NULL AND a.sha1 = f.sha1 THEN 1 ELSE 0 END AS matched_sha1,
+            CASE WHEN a.sha256 IS NOT NULL AND a.sha256 = f.sha256 THEN 1 ELSE 0 END AS matched_sha256,
+            CASE WHEN a.blake3 IS NOT NULL AND a.blake3 = f.blake3 THEN 1 ELSE 0 END AS matched_blake3,
+            CASE WHEN a.size_bytes IS NOT NULL AND a.size_bytes = f.size_bytes THEN 1 ELSE 0 END AS size_matched
+        {_goldrush_match_from_sql()}
+        {filter_sql}
+        ORDER BY a.id DESC, f.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (*params, bounded_limit, bounded_offset),
+    ).fetchall()
+    return [_goldrush_match_row(row) for row in rows]
+
+
+def count_goldrush_matches(
+    connection: sqlite3.Connection,
+    *,
+    query: str | None = None,
+) -> int:
+    filter_sql, params = _goldrush_match_filter(query)
+    row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS total
+        {_goldrush_match_from_sql()}
+        {filter_sql}
+        """,
+        params,
+    ).fetchone()
+    return int(row["total"] if row is not None else 0)
+
+
 def list_files(
     connection: sqlite3.Connection,
     *,
     limit: int = 50,
     offset: int = 0,
     query: str | None = None,
+    sort_by: str = "id",
+    sort_direction: str = "desc",
 ) -> list[dict[str, Any]]:
     bounded_limit = min(max(limit, 1), 200)
     bounded_offset = max(offset, 0)
-    if query:
-        like = f"%{query}%"
-        rows = connection.execute(
-            """
-            SELECT DISTINCT f.id
-            FROM ufid_file f
-            LEFT JOIN ufid_file_meta fm ON fm.file_id = f.id
-            LEFT JOIN ufid_archive_member am ON am.parent_file_id = f.id
-            LEFT JOIN ufid_identity_conflict cf
-              ON cf.file_id = f.id OR cf.related_file_id = f.id
-            WHERE CAST(f.size_bytes AS TEXT) LIKE ?
-               OR f.crc32 LIKE ?
-               OR f.md5 LIKE ?
-               OR f.sha1 LIKE ?
-               OR f.sha256 LIKE ?
-               OR f.blake3 LIKE ?
-               OR fm.metadata_type LIKE ?
-               OR fm.name LIKE ?
-               OR fm.value LIKE ?
-               OR fm.notes LIKE ?
-               OR am.archive_path LIKE ?
-               OR cf.conflict_type LIKE ?
-               OR cf.algorithm LIKE ?
-               OR cf.existing_value LIKE ?
-               OR cf.incoming_value LIKE ?
-               OR cf.notes LIKE ?
-            ORDER BY f.id DESC
-            LIMIT ? OFFSET ?
-            """,
-            (
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                like,
-                bounded_limit,
-                bounded_offset,
-            ),
-        ).fetchall()
-    else:
-        rows = connection.execute(
-            """
-            SELECT id
-            FROM ufid_file
-            ORDER BY id DESC
-            LIMIT ? OFFSET ?
-            """,
-            (bounded_limit, bounded_offset),
-        ).fetchall()
+    sort_sql, direction_sql = _file_list_sort(sort_by, sort_direction)
+    tie_breaker = "" if sort_by == "id" else ", f.id DESC"
+    where_sql, params = _file_list_filter(query)
+    rows = connection.execute(
+        f"""
+        SELECT f.id
+        FROM ufid_file f
+        {where_sql}
+        ORDER BY {sort_sql} {direction_sql}{tie_breaker}
+        LIMIT ? OFFSET ?
+        """,
+        (*params, bounded_limit, bounded_offset),
+    ).fetchall()
 
     return [
         record
         for row in rows
         if (record := get_file(connection, int(row["id"]))) is not None
     ]
+
+
+def count_files(
+    connection: sqlite3.Connection,
+    *,
+    query: str | None = None,
+) -> int:
+    where_sql, params = _file_list_filter(query)
+    row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM ufid_file f
+        {where_sql}
+        """,
+        params,
+    ).fetchone()
+    return int(row["total"] if row is not None else 0)
 
 
 def upsert_file_identity(
@@ -1253,6 +1511,342 @@ def _metadata_entries(
             "value": str(value),
             "notes": None if item.get("notes") is None else str(item["notes"]),
         }
+
+
+def _normalize_goldrush_alert(alert: Mapping[str, Any]) -> dict[str, Any]:
+    hashes_payload = alert.get("hashes") or {}
+    if not isinstance(hashes_payload, Mapping):
+        raise ValueError("hashes must be an object")
+    raw_hashes: dict[str, str | None] = {
+        str(key): None if value is None else str(value)
+        for key, value in hashes_payload.items()
+    }
+    for algorithm in SUPPORTED_HASH_ALGORITHMS:
+        if algorithm in alert and alert[algorithm] is not None:
+            raw_hashes[algorithm] = str(alert[algorithm])
+
+    hashes = normalize_hashes(raw_hashes)
+    if not hashes:
+        raise ValueError("at least one supported hash is required")
+    _validate_hash_values(hashes)
+
+    normalized = {
+        "name": _required_text(alert.get("name"), "name"),
+        "description": _required_text(alert.get("description"), "description"),
+        "size_bytes": _optional_size_bytes(alert.get("size_bytes")),
+        "source_type": _optional_text(alert.get("source_type")),
+        "source_name": _optional_text(alert.get("source_name")),
+        "source_detail": _optional_text(alert.get("source_detail")),
+    }
+    for algorithm in SUPPORTED_HASH_ALGORITHMS:
+        normalized[algorithm] = hashes.get(algorithm)
+    normalized["fingerprint"] = _goldrush_fingerprint(normalized)
+    return normalized
+
+
+def _insert_goldrush_alert(
+    connection: sqlite3.Connection,
+    row: Mapping[str, Any],
+) -> bool:
+    values = [row[column] for column in GOLDRUSH_ALERT_COLUMNS]
+    placeholders = ", ".join("?" for _ in GOLDRUSH_ALERT_COLUMNS)
+    columns = ", ".join(GOLDRUSH_ALERT_COLUMNS)
+    cursor = connection.execute(
+        f"""
+        INSERT OR IGNORE INTO ufid_goldrush_alert ({columns})
+        VALUES ({placeholders})
+        """,
+        values,
+    )
+    return cursor.rowcount > 0
+
+
+def _get_goldrush_alert_by_fingerprint(
+    connection: sqlite3.Connection,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT * FROM ufid_goldrush_alert WHERE fingerprint = ?",
+        (fingerprint,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _goldrush_alert_row(row)
+
+
+def _goldrush_alert_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    result.pop("fingerprint", None)
+    result["hashes"] = {
+        algorithm: result.get(algorithm)
+        for algorithm in SUPPORTED_HASH_ALGORITHMS
+    }
+    return result
+
+
+def _goldrush_match_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    values = dict(row)
+    alert_hashes = {
+        algorithm: values.get(f"alert_{algorithm}")
+        for algorithm in SUPPORTED_HASH_ALGORITHMS
+    }
+    file_hashes = {
+        algorithm: values.get(f"file_{algorithm}")
+        for algorithm in SUPPORTED_HASH_ALGORITHMS
+    }
+    matched_algorithms = [
+        algorithm
+        for algorithm in SUPPORTED_HASH_ALGORITHMS
+        if values.get(f"matched_{algorithm}")
+    ]
+    return {
+        "alert": {
+            "id": values["alert_id"],
+            "name": values["alert_name"],
+            "description": values["alert_description"],
+            "size_bytes": values["alert_size_bytes"],
+            "hashes": alert_hashes,
+            "source_type": values["alert_source_type"],
+            "source_name": values["alert_source_name"],
+            "source_detail": values["alert_source_detail"],
+            "created_at": values["alert_created_at"],
+        },
+        "file": {
+            "id": values["file_id"],
+            "size_bytes": values["file_size_bytes"],
+            "display_name": values["file_display_name"] or None,
+            "content_type": values["file_content_type"],
+            "hashes": file_hashes,
+        },
+        "matched_algorithms": matched_algorithms,
+        "size_matched": bool(values["size_matched"]),
+    }
+
+
+def _goldrush_alert_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
+    if not query:
+        return "", ()
+    like = f"%{query}%"
+    return (
+        """
+        WHERE CAST(a.id AS TEXT) LIKE ?
+           OR CAST(a.size_bytes AS TEXT) LIKE ?
+           OR a.name LIKE ?
+           OR a.description LIKE ?
+           OR a.crc32 LIKE ?
+           OR a.md5 LIKE ?
+           OR a.sha1 LIKE ?
+           OR a.sha256 LIKE ?
+           OR a.blake3 LIKE ?
+           OR a.source_type LIKE ?
+           OR a.source_name LIKE ?
+           OR a.source_detail LIKE ?
+        """,
+        (like, like, like, like, like, like, like, like, like, like, like, like),
+    )
+
+
+def _goldrush_match_from_sql() -> str:
+    return """
+        FROM ufid_goldrush_alert a
+        JOIN ufid_file f
+          ON (
+              (a.crc32 IS NOT NULL AND a.crc32 = f.crc32)
+           OR (a.md5 IS NOT NULL AND a.md5 = f.md5)
+           OR (a.sha1 IS NOT NULL AND a.sha1 = f.sha1)
+           OR (a.sha256 IS NOT NULL AND a.sha256 = f.sha256)
+           OR (a.blake3 IS NOT NULL AND a.blake3 = f.blake3)
+          )
+        WHERE (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
+    """
+
+
+def _goldrush_match_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
+    if not query:
+        return "", ()
+    like = f"%{query}%"
+    return (
+        """
+          AND (
+              CAST(a.id AS TEXT) LIKE ?
+           OR CAST(f.id AS TEXT) LIKE ?
+           OR CAST(a.size_bytes AS TEXT) LIKE ?
+           OR CAST(f.size_bytes AS TEXT) LIKE ?
+           OR a.name LIKE ?
+           OR a.description LIKE ?
+           OR a.crc32 LIKE ?
+           OR a.md5 LIKE ?
+           OR a.sha1 LIKE ?
+           OR a.sha256 LIKE ?
+           OR a.blake3 LIKE ?
+           OR a.source_type LIKE ?
+           OR a.source_name LIKE ?
+           OR a.source_detail LIKE ?
+           OR f.crc32 LIKE ?
+           OR f.md5 LIKE ?
+           OR f.sha1 LIKE ?
+           OR f.sha256 LIKE ?
+           OR f.blake3 LIKE ?
+           OR EXISTS (
+                SELECT 1
+                FROM ufid_file_meta fm
+                WHERE fm.file_id = f.id
+                  AND (
+                    fm.name LIKE ?
+                    OR fm.value LIKE ?
+                    OR fm.notes LIKE ?
+                  )
+           )
+          )
+        """,
+        (
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+        ),
+    )
+
+
+def _required_text(value: Any, name: str) -> str:
+    text = _optional_text(value)
+    if text is None:
+        raise ValueError(f"{name} is required")
+    return text
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_size_bytes(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("size_bytes must be a non-negative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("size_bytes must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ValueError("size_bytes must be a non-negative integer")
+    return parsed
+
+
+def _goldrush_fingerprint(row: Mapping[str, Any]) -> str:
+    payload = {
+        "name": row.get("name"),
+        "description": row.get("description"),
+        "size_bytes": row.get("size_bytes"),
+        "hashes": {
+            algorithm: row.get(algorithm)
+            for algorithm in SUPPORTED_HASH_ALGORITHMS
+        },
+        "source_type": row.get("source_type"),
+        "source_name": row.get("source_name"),
+        "source_detail": row.get("source_detail"),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _file_list_sort(sort_by: str, sort_direction: str) -> tuple[str, str]:
+    key = (sort_by or "id").strip().lower()
+    if key not in FILE_LIST_SORT_COLUMNS:
+        supported = ", ".join(sorted(FILE_LIST_SORT_COLUMNS))
+        raise ValueError(f"sort must be one of: {supported}")
+
+    direction = (sort_direction or "desc").strip().lower()
+    if direction not in {"asc", "desc"}:
+        raise ValueError("direction must be asc or desc")
+
+    return FILE_LIST_SORT_COLUMNS[key], direction.upper()
+
+
+def _file_list_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
+    if not query:
+        return "", ()
+    like = f"%{query}%"
+    return (
+        """
+        WHERE CAST(f.id AS TEXT) LIKE ?
+           OR CAST(f.size_bytes AS TEXT) LIKE ?
+           OR f.crc32 LIKE ?
+           OR f.md5 LIKE ?
+           OR f.sha1 LIKE ?
+           OR f.sha256 LIKE ?
+           OR f.blake3 LIKE ?
+           OR EXISTS (
+                SELECT 1
+                FROM ufid_file_meta fm
+                WHERE fm.file_id = f.id
+                  AND (
+                    fm.metadata_type LIKE ?
+                    OR fm.name LIKE ?
+                    OR fm.value LIKE ?
+                    OR fm.notes LIKE ?
+                  )
+           )
+           OR EXISTS (
+                SELECT 1
+                FROM ufid_archive_member am
+                WHERE am.parent_file_id = f.id
+                  AND am.archive_path LIKE ?
+           )
+           OR EXISTS (
+                SELECT 1
+                FROM ufid_identity_conflict cf
+                WHERE (cf.file_id = f.id OR cf.related_file_id = f.id)
+                  AND (
+                    cf.conflict_type LIKE ?
+                    OR cf.algorithm LIKE ?
+                    OR cf.existing_value LIKE ?
+                    OR cf.incoming_value LIKE ?
+                    OR cf.notes LIKE ?
+                  )
+           )
+        """,
+        (
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+            like,
+        ),
+    )
 
 
 def _insert_metadata_if_new(

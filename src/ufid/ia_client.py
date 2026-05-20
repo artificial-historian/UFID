@@ -114,6 +114,9 @@ class DownloadResult:
     resumed: bool
 
 
+DownloadProgressCallback = Callable[[int, int | None], None]
+
+
 class RateLimiter:
     def __init__(
         self,
@@ -260,6 +263,7 @@ class IAHTTPClient:
         ia_file: IAFile,
         destination: Path,
         resume: bool = True,
+        progress_callback: DownloadProgressCallback | None = None,
     ) -> DownloadResult:
         destination.parent.mkdir(parents=True, exist_ok=True)
         part_path = destination.with_name(destination.name + ".part")
@@ -287,6 +291,8 @@ class IAHTTPClient:
                         existing = 0
 
                     bytes_written = existing
+                    if progress_callback is not None:
+                        progress_callback(bytes_written, ia_file.size)
                     with part_path.open(mode) as output:
                         while True:
                             chunk = response.read(1024 * 1024)
@@ -294,6 +300,8 @@ class IAHTTPClient:
                                 break
                             output.write(chunk)
                             bytes_written += len(chunk)
+                            if progress_callback is not None:
+                                progress_callback(bytes_written, ia_file.size)
 
                 if ia_file.size is not None and bytes_written != ia_file.size:
                     raise IADownloadError(
@@ -315,6 +323,8 @@ class IAHTTPClient:
                     if code == 416 and ia_file.size is not None and part_path.exists():
                         if part_path.stat().st_size == ia_file.size:
                             os.replace(part_path, destination)
+                            if progress_callback is not None:
+                                progress_callback(ia_file.size, ia_file.size)
                             return DownloadResult(
                                 path=destination,
                                 url=url,

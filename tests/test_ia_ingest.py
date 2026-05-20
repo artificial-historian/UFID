@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import closing, redirect_stdout
 from email.message import Message
 from io import BytesIO, StringIO
+import gzip
 import hashlib
 from pathlib import Path
 import sys
@@ -29,7 +30,13 @@ from ufid.ia_client import (
     safe_download_path,
     verify_declared_fixity,
 )
-from ufid.ia_ingest import IAIngestRunner, IngestOptions, build_parser, options_from_args
+from ufid.ia_ingest import (
+    IAIngestRunner,
+    IngestOptions,
+    build_parser,
+    options_from_args,
+    parse_size_limit,
+)
 from ufid.ia_state import IAIngestState
 from ufid.paths import default_user_data_dir
 
@@ -101,10 +108,21 @@ class FakeIAClient:
             "files": [file_record],
         }
 
-    def download_file(self, *, identifier: str, ia_file: IAFile, destination: Path, resume: bool):
+    def download_file(
+        self,
+        *,
+        identifier: str,
+        ia_file: IAFile,
+        destination: Path,
+        resume: bool,
+        progress_callback=None,
+    ):
         self.download_calls += 1
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(self.payload)
+        if progress_callback is not None:
+            progress_callback(0, len(self.payload))
+            progress_callback(len(self.payload), len(self.payload))
         return DownloadResult(
             path=destination,
             url=file_url(identifier, ia_file.name),
@@ -303,9 +321,16 @@ class CollectionGrowthClient(CollectionNoGrowthClient):
 
 
 class FakeResponse:
-    def __init__(self, payload: bytes, headers: Message | None = None) -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        headers: Message | None = None,
+        status: int = 200,
+    ) -> None:
         self.payload = payload
+        self._stream = BytesIO(payload)
         self.headers = headers or Message()
+        self.status = status
 
     def __enter__(self):
         return self
@@ -313,8 +338,11 @@ class FakeResponse:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def read(self) -> bytes:
-        return self.payload
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def getcode(self) -> int:
+        return self.status
 
 
 def zip_payload() -> bytes:
@@ -344,12 +372,15 @@ def options(db_path: Path, state_path: Path, cache_path: Path) -> IngestOptions:
         max_items=1,
         max_files=None,
         max_file_bytes=None,
+        min_size_bytes=None,
+        max_size_bytes=None,
         original_only=False,
         skip_metadata_files=False,
         keep_cache=False,
         retry_failed=False,
         dry_run=False,
         no_archive_scan=False,
+        deep_discover_archives=False,
         allow_checksum_mismatch=False,
         discover_collections=False,
         max_collection_depth=1,
@@ -366,14 +397,43 @@ class InternetArchiveIngestTests(unittest.TestCase):
         parsed_without_discovery = build_parser().parse_args(
             ["--no-discover-collections"]
         )
+        parsed_with_limits = build_parser().parse_args(
+            [
+                "--mode",
+                "download",
+                "--min-size",
+                "10k",
+                "--max-size",
+                "100k",
+                "--deep-discover-archives",
+            ]
+        )
 
         defaults = options_from_args(parsed)
         without_discovery = options_from_args(parsed_without_discovery)
+        with_limits = options_from_args(parsed_with_limits)
 
         self.assertEqual(defaults.query, "collection:vintagesoftware")
         self.assertTrue(defaults.discover_collections)
         self.assertEqual(defaults.max_collection_depth, 1)
+        self.assertFalse(defaults.deep_discover_archives)
         self.assertFalse(without_discovery.discover_collections)
+        self.assertEqual(with_limits.min_size_bytes, 10 * 1024)
+        self.assertEqual(with_limits.max_size_bytes, 100 * 1024)
+        self.assertTrue(with_limits.deep_discover_archives)
+
+    def test_parser_rejects_inverted_size_window(self) -> None:
+        parsed = build_parser().parse_args(
+            ["--min-size", "2M", "--max-size", "1M"]
+        )
+        with self.assertRaisesRegex(ValueError, "min-size"):
+            options_from_args(parsed)
+
+    def test_size_limit_parser_accepts_magnitude_suffixes(self) -> None:
+        self.assertEqual(parse_size_limit("100k"), 100 * 1024)
+        self.assertEqual(parse_size_limit("2M"), 2 * 1024 * 1024)
+        self.assertEqual(parse_size_limit("1.5G"), int(1.5 * 1024**3))
+        self.assertEqual(parse_size_limit("42"), 42)
 
     def test_url_and_metadata_helpers_are_current_shape(self) -> None:
         self.assertEqual(
@@ -420,6 +480,35 @@ class InternetArchiveIngestTests(unittest.TestCase):
 
         self.assertEqual(data, {"ok": True})
         self.assertEqual(calls["count"], 2)
+
+    def test_http_client_reports_download_progress(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        payload = b"a" * (1024 * 1024 + 17)
+        destination = SCRATCH / f"progress-{uuid.uuid4().hex}.zip"
+        events: list[tuple[int, int | None]] = []
+
+        def fake_urlopen(request, timeout):
+            return FakeResponse(payload)
+
+        client = IAHTTPClient(
+            user_agent="UFID-IA-Ingest-Test/0.1.0",
+            max_retries=0,
+            download_delay_seconds=0,
+            sleep_func=lambda seconds: None,
+        )
+        with patch("ufid.ia_client.urlopen", fake_urlopen):
+            result = client.download_file(
+                identifier="fake-software-item",
+                ia_file=IAFile(name="downloads/archive.zip", size=len(payload)),
+                destination=destination,
+                progress_callback=lambda written, total: events.append((written, total)),
+            )
+
+        self.assertEqual(result.bytes_written, len(payload))
+        self.assertEqual(destination.read_bytes(), payload)
+        self.assertEqual(events[0], (0, len(payload)))
+        self.assertEqual(events[-1], (len(payload), len(payload)))
+        self.assertGreaterEqual(len(events), 3)
 
     def test_declared_fixity_checks_all_available_required_hashes(self) -> None:
         ia_file = IAFile(
@@ -806,6 +895,297 @@ class InternetArchiveIngestTests(unittest.TestCase):
         self.assertIsNotNone(current)
         assert current is not None
         self.assertEqual(current.status, "done")
+
+    def test_download_mode_does_not_archive_scan_complete_single_file_gzip(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"ia-ufid-skip-gzip-{uuid.uuid4().hex}.sqlite"
+        state_path = SCRATCH / f"ia-state-skip-gzip-{uuid.uuid4().hex}.sqlite"
+        cache_path = SCRATCH / f"ia-cache-skip-gzip-{uuid.uuid4().hex}"
+        payload = gzip.compress(b"ocr derivative text")
+        file_name = "downloads/page_hocr.html.gz"
+        metadata_opts = IngestOptions(
+            **{**options(db_path, state_path, cache_path).__dict__, "mode": "metadata"}
+        )
+        metadata_runner = IAIngestRunner(
+            metadata_opts,
+            client=FakeIAClient(
+                payload,
+                file_name=file_name,
+                file_format="GZIP",
+            ),
+        )
+        try:
+            with redirect_stdout(StringIO()):
+                metadata_runner.run()
+        finally:
+            metadata_runner.close()
+
+        download_client = FakeIAClient(
+            payload,
+            file_name=file_name,
+            file_format="GZIP",
+            fail_metadata=True,
+            fail_scrape=True,
+        )
+        download_opts = IngestOptions(
+            **{**options(db_path, state_path, cache_path).__dict__, "mode": "download"}
+        )
+        download_runner = IAIngestRunner(download_opts, client=download_client)
+        try:
+            with redirect_stdout(StringIO()):
+                stats = download_runner.run()
+        finally:
+            download_runner.close()
+
+        state = IAIngestState(state_path)
+        try:
+            queued = state.iter_processable_files(retry_failed=False)
+            current = state.get_file("fake-software-item", file_name)
+        finally:
+            state.close()
+
+        self.assertEqual(download_client.download_calls, 0)
+        self.assertEqual(stats.processed_files, 0)
+        self.assertEqual(stats.skipped_files, 1)
+        self.assertEqual(queued, [])
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.status, "done")
+
+    def test_download_mode_defers_incomplete_single_file_gzip_by_default(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"ia-ufid-defer-gzip-{uuid.uuid4().hex}.sqlite"
+        state_path = SCRATCH / f"ia-state-defer-gzip-{uuid.uuid4().hex}.sqlite"
+        cache_path = SCRATCH / f"ia-cache-defer-gzip-{uuid.uuid4().hex}"
+        payload = gzip.compress(b"ocr derivative text")
+        file_name = "downloads/page_hocr.html.gz"
+        metadata_opts = IngestOptions(
+            **{**options(db_path, state_path, cache_path).__dict__, "mode": "metadata"}
+        )
+        metadata_runner = IAIngestRunner(
+            metadata_opts,
+            client=FakeIAClient(
+                payload,
+                omit_file_fields=("crc32", "sha1"),
+                file_name=file_name,
+                file_format="GZIP",
+            ),
+        )
+        try:
+            with redirect_stdout(StringIO()):
+                metadata_runner.run()
+        finally:
+            metadata_runner.close()
+
+        download_client = FakeIAClient(
+            payload,
+            omit_file_fields=("crc32", "sha1"),
+            file_name=file_name,
+            file_format="GZIP",
+            fail_metadata=True,
+            fail_scrape=True,
+        )
+        download_opts = IngestOptions(
+            **{**options(db_path, state_path, cache_path).__dict__, "mode": "download"}
+        )
+        download_runner = IAIngestRunner(download_opts, client=download_client)
+        try:
+            with redirect_stdout(StringIO()):
+                stats = download_runner.run()
+        finally:
+            download_runner.close()
+
+        state = IAIngestState(state_path)
+        try:
+            queued = state.iter_processable_files(retry_failed=False)
+            current = state.get_file("fake-software-item", file_name)
+        finally:
+            state.close()
+
+        self.assertEqual(download_client.download_calls, 0)
+        self.assertEqual(stats.processed_files, 0)
+        self.assertEqual(stats.skipped_files, 1)
+        self.assertEqual(len(queued), 1)
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.status, "pending")
+
+    def test_download_mode_defers_non_archive_missing_identity_by_default(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"ia-ufid-defer-plain-{uuid.uuid4().hex}.sqlite"
+        state_path = SCRATCH / f"ia-state-defer-plain-{uuid.uuid4().hex}.sqlite"
+        cache_path = SCRATCH / f"ia-cache-defer-plain-{uuid.uuid4().hex}"
+        payload = b"plain payload without complete IA identity"
+        metadata_opts = IngestOptions(
+            **{**options(db_path, state_path, cache_path).__dict__, "mode": "metadata"}
+        )
+        metadata_runner = IAIngestRunner(
+            metadata_opts,
+            client=FakeIAClient(
+                payload,
+                omit_file_fields=("crc32", "sha1"),
+                file_name="downloads/plain.txt",
+                file_format="Text",
+            ),
+        )
+        try:
+            with redirect_stdout(StringIO()):
+                metadata_runner.run()
+        finally:
+            metadata_runner.close()
+
+        download_client = FakeIAClient(
+            payload,
+            omit_file_fields=("crc32", "sha1"),
+            file_name="downloads/plain.txt",
+            file_format="Text",
+            fail_metadata=True,
+            fail_scrape=True,
+        )
+        download_opts = IngestOptions(
+            **{**options(db_path, state_path, cache_path).__dict__, "mode": "download"}
+        )
+        download_runner = IAIngestRunner(download_opts, client=download_client)
+        try:
+            with redirect_stdout(StringIO()):
+                stats = download_runner.run()
+        finally:
+            download_runner.close()
+
+        state = IAIngestState(state_path)
+        try:
+            queued = state.iter_processable_files(retry_failed=False)
+            current = state.get_file("fake-software-item", "downloads/plain.txt")
+        finally:
+            state.close()
+
+        self.assertEqual(download_client.download_calls, 0)
+        self.assertEqual(stats.processed_files, 0)
+        self.assertEqual(stats.skipped_files, 1)
+        self.assertEqual(len(queued), 1)
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.status, "pending")
+
+        deep_client = FakeIAClient(
+            payload,
+            omit_file_fields=("crc32", "sha1"),
+            file_name="downloads/plain.txt",
+            file_format="Text",
+            fail_metadata=True,
+            fail_scrape=True,
+        )
+        deep_opts = IngestOptions(
+            **{
+                **options(db_path, state_path, cache_path).__dict__,
+                "mode": "download",
+                "deep_discover_archives": True,
+            }
+        )
+        deep_runner = IAIngestRunner(deep_opts, client=deep_client)
+        try:
+            with redirect_stdout(StringIO()):
+                deep_stats = deep_runner.run()
+        finally:
+            deep_runner.close()
+
+        with closing(connect(db_path)) as connection:
+            files = list_files(connection)
+        self.assertEqual(deep_client.download_calls, 1)
+        self.assertEqual(deep_stats.processed_files, 1)
+        self.assertEqual(files[0]["display_name"], "plain.txt")
+
+    def test_download_mode_max_size_defers_queue_without_marking_skipped(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"ia-ufid-max-size-{uuid.uuid4().hex}.sqlite"
+        state_path = SCRATCH / f"ia-state-max-size-{uuid.uuid4().hex}.sqlite"
+        cache_path = SCRATCH / f"ia-cache-max-size-{uuid.uuid4().hex}"
+        payload = zip_payload()
+        metadata_opts = IngestOptions(
+            **{**options(db_path, state_path, cache_path).__dict__, "mode": "metadata"}
+        )
+        metadata_runner = IAIngestRunner(metadata_opts, client=FakeIAClient(payload))
+        try:
+            with redirect_stdout(StringIO()):
+                metadata_runner.run()
+        finally:
+            metadata_runner.close()
+
+        download_client = FakeIAClient(payload, fail_metadata=True, fail_scrape=True)
+        download_opts = IngestOptions(
+            **{
+                **options(db_path, state_path, cache_path).__dict__,
+                "mode": "download",
+                "max_size_bytes": len(payload) - 1,
+            }
+        )
+        download_runner = IAIngestRunner(download_opts, client=download_client)
+        try:
+            with redirect_stdout(StringIO()):
+                stats = download_runner.run()
+        finally:
+            download_runner.close()
+
+        state = IAIngestState(state_path)
+        try:
+            queued = state.iter_processable_files(retry_failed=False)
+            current = state.get_file("fake-software-item", "downloads/archive.zip")
+        finally:
+            state.close()
+
+        self.assertEqual(download_client.download_calls, 0)
+        self.assertEqual(stats.processed_files, 0)
+        self.assertEqual(stats.skipped_files, 1)
+        self.assertEqual(len(queued), 1)
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.status, "pending")
+
+    def test_download_mode_min_size_defers_queue_without_marking_skipped(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"ia-ufid-min-size-{uuid.uuid4().hex}.sqlite"
+        state_path = SCRATCH / f"ia-state-min-size-{uuid.uuid4().hex}.sqlite"
+        cache_path = SCRATCH / f"ia-cache-min-size-{uuid.uuid4().hex}"
+        payload = zip_payload()
+        metadata_opts = IngestOptions(
+            **{**options(db_path, state_path, cache_path).__dict__, "mode": "metadata"}
+        )
+        metadata_runner = IAIngestRunner(metadata_opts, client=FakeIAClient(payload))
+        try:
+            with redirect_stdout(StringIO()):
+                metadata_runner.run()
+        finally:
+            metadata_runner.close()
+
+        download_client = FakeIAClient(payload, fail_metadata=True, fail_scrape=True)
+        download_opts = IngestOptions(
+            **{
+                **options(db_path, state_path, cache_path).__dict__,
+                "mode": "download",
+                "min_size_bytes": len(payload) + 1,
+            }
+        )
+        download_runner = IAIngestRunner(download_opts, client=download_client)
+        try:
+            with redirect_stdout(StringIO()):
+                stats = download_runner.run()
+        finally:
+            download_runner.close()
+
+        state = IAIngestState(state_path)
+        try:
+            queued = state.iter_processable_files(retry_failed=False)
+            current = state.get_file("fake-software-item", "downloads/archive.zip")
+        finally:
+            state.close()
+
+        self.assertEqual(download_client.download_calls, 0)
+        self.assertEqual(stats.processed_files, 0)
+        self.assertEqual(stats.skipped_files, 1)
+        self.assertEqual(len(queued), 1)
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.status, "pending")
 
     def test_download_mode_processes_existing_queue_without_scrape_or_metadata(self) -> None:
         SCRATCH.mkdir(exist_ok=True)

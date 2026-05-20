@@ -96,7 +96,7 @@ Useful options:
 ```powershell
 .\scripts\start_windows_local_ia_discovery.ps1 -Collection software -MaxItems 1000
 .\scripts\start_windows_local_ia_discovery.ps1 -Query "collection:software AND format:ZIP" -MaxItems 500
-.\scripts\start_windows_local_ia_discovery.ps1 -UserAgent "UFID-IA-Ingest/0.5.0rc1 (contact: you@example.com)"
+.\scripts\start_windows_local_ia_discovery.ps1 -UserAgent "UFID-IA-Ingest/0.6.0rc1 (contact: you@example.com)"
 .\scripts\start_windows_local_ia_discovery.ps1 -Port 8876 -PortScanCount 1
 .\scripts\start_windows_local_ia_discovery.ps1 -CreateAdmin -AdminUsername admin
 .\scripts\start_windows_local_ia_discovery.ps1 -Debug -MaxItems 100
@@ -113,6 +113,7 @@ The SQLite schema mirrors the PostgreSQL model for current local features:
 - `ufid_identity_conflict`
 - `ufid_source`
 - `ufid_file_source`
+- `ufid_goldrush_alert`
 - `ufid_user_account`
 - `ufid_role`
 - `ufid_user_role`

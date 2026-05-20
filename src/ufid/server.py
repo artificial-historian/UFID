@@ -20,20 +20,28 @@ from ufid.database import (
     add_file_metadata,
     authenticate_user,
     connect,
+    count_files,
+    count_goldrush_alerts,
+    count_goldrush_matches,
+    create_goldrush_alert,
     create_session,
     create_user,
     find_files_by_hash,
     get_authenticated_user,
     get_file,
+    import_goldrush_alerts,
+    list_goldrush_alerts,
     list_files,
+    list_goldrush_matches,
     revoke_session,
     upsert_file_identity,
 )
+from ufid.goldrush import parse_logiqx_dat
 from ufid.paths import default_sqlite_db_path, resolve_web_root
 
 
 LOGGER = logging.getLogger(__name__)
-MAX_JSON_BODY_BYTES = 10 * 1024 * 1024
+MAX_JSON_BODY_BYTES = 64 * 1024 * 1024
 
 
 class UFIDRequestHandler(SimpleHTTPRequestHandler):
@@ -84,6 +92,16 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
                 return
             self._handle_list_files(parsed.query)
             return
+        if parsed.path == "/api/v1/goldrush/alerts":
+            if not self._require_role("reader"):
+                return
+            self._handle_list_goldrush_alerts(parsed.query)
+            return
+        if parsed.path == "/api/v1/goldrush/matches":
+            if not self._require_role("reader"):
+                return
+            self._handle_list_goldrush_matches(parsed.query)
+            return
         if parsed.path.startswith("/api/v1/files/"):
             if not self._require_role("reader"):
                 return
@@ -117,6 +135,16 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             if not self._require_role("contributor"):
                 return
             self._handle_upsert_file()
+            return
+        if parsed.path == "/api/v1/goldrush/alerts":
+            if not self._require_role("contributor"):
+                return
+            self._handle_create_goldrush_alert()
+            return
+        if parsed.path == "/api/v1/goldrush/import-dat":
+            if not self._require_role("contributor"):
+                return
+            self._handle_import_goldrush_dat()
             return
         if (
             parsed.path.startswith("/api/v1/files/")
@@ -255,25 +283,96 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
         try:
             limit = _int_query_value(params, "limit", default=50)
             offset = _int_query_value(params, "offset", default=0)
+            limit = _bounded_list_limit(limit)
+            sort_by = (_single_query_value(params, "sort") or "id").strip().lower()
+            sort_direction = (_single_query_value(params, "direction") or "desc").strip().lower()
         except ValueError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
         search = _single_query_value(params, "q")
-        with self._connect() as connection:
-            files = list_files(
-                connection,
-                limit=limit,
-                offset=offset,
-                query=search,
-            )
+        try:
+            with self._connect() as connection:
+                files = list_files(
+                    connection,
+                    limit=limit,
+                    offset=offset,
+                    query=search,
+                    sort_by=sort_by,
+                    sort_direction=sort_direction,
+                )
+                total_count = count_files(connection, query=search)
+        except ValueError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         self._write_json(
             {
                 "files": files,
                 "limit": limit,
                 "offset": offset,
                 "count": len(files),
-                "next_offset": offset + len(files) if len(files) == limit else None,
+                "total_count": total_count,
+                "sort": sort_by,
+                "direction": sort_direction,
+                "next_offset": offset + len(files) if offset + len(files) < total_count else None,
+            }
+        )
+
+    def _handle_list_goldrush_alerts(self, query: str) -> None:
+        params = parse_qs(query)
+        try:
+            limit = _bounded_list_limit(_int_query_value(params, "limit", default=200))
+            offset = _int_query_value(params, "offset", default=0)
+        except ValueError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        search = _single_query_value(params, "q")
+        with self._connect() as connection:
+            alerts = list_goldrush_alerts(
+                connection,
+                limit=limit,
+                offset=offset,
+                query=search,
+            )
+            total_count = count_goldrush_alerts(connection, query=search)
+        self._write_json(
+            {
+                "alerts": alerts,
+                "limit": limit,
+                "offset": offset,
+                "count": len(alerts),
+                "total_count": total_count,
+                "next_offset": offset + len(alerts) if offset + len(alerts) < total_count else None,
+            }
+        )
+
+    def _handle_list_goldrush_matches(self, query: str) -> None:
+        params = parse_qs(query)
+        try:
+            limit = _bounded_list_limit(_int_query_value(params, "limit", default=200))
+            offset = _int_query_value(params, "offset", default=0)
+        except ValueError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        search = _single_query_value(params, "q")
+        with self._connect() as connection:
+            matches = list_goldrush_matches(
+                connection,
+                limit=limit,
+                offset=offset,
+                query=search,
+            )
+            total_count = count_goldrush_matches(connection, query=search)
+        self._write_json(
+            {
+                "matches": matches,
+                "limit": limit,
+                "offset": offset,
+                "count": len(matches),
+                "total_count": total_count,
+                "next_offset": offset + len(matches) if offset + len(matches) < total_count else None,
             }
         )
 
@@ -335,6 +434,66 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             },
             status=HTTPStatus.CREATED if result.created else HTTPStatus.OK,
         )
+
+    def _handle_create_goldrush_alert(self) -> None:
+        try:
+            payload = self._read_json()
+            hashes = payload.get("hashes")
+            if not isinstance(hashes, dict) or not hashes:
+                raise ValueError("hashes object is required")
+            with self._connect() as connection:
+                result = create_goldrush_alert(
+                    connection,
+                    name=str(payload.get("name") or ""),
+                    description=str(payload.get("description") or ""),
+                    size_bytes=payload.get("size_bytes"),
+                    hashes={
+                        str(key): None if value is None else str(value)
+                        for key, value in hashes.items()
+                    },
+                    source_type=payload.get("source_type"),
+                    source_name=payload.get("source_name"),
+                    source_detail=payload.get("source_detail"),
+                )
+        except sqlite3.IntegrityError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        self._write_json(
+            result,
+            status=HTTPStatus.CREATED if result["created"] else HTTPStatus.OK,
+        )
+
+    def _handle_import_goldrush_dat(self) -> None:
+        try:
+            payload = self._read_json()
+            dat_text = payload.get("text") or payload.get("content") or payload.get("dat")
+            if not isinstance(dat_text, str) or not dat_text.strip():
+                raise ValueError("text is required")
+            filename = payload.get("filename") or payload.get("name")
+            filename = None if filename is None else str(filename)
+            parsed = parse_logiqx_dat(dat_text, filename=filename)
+            with self._connect() as connection:
+                result = import_goldrush_alerts(connection, parsed.alerts)
+        except sqlite3.IntegrityError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        response = {
+            "source_name": parsed.source_name,
+            "parsed": len(parsed.alerts),
+            **result,
+        }
+        status = HTTPStatus.CREATED if result["created"] else HTTPStatus.OK
+        if result["valid"] == 0 and result["errors"]:
+            status = HTTPStatus.BAD_REQUEST
+        self._write_json(response, status=status)
 
     def _handle_add_file_metadata(self, path: str) -> None:
         raw_file_id = (
@@ -520,6 +679,10 @@ def _int_query_value(
     if parsed < 0:
         raise ValueError(f"{key} cannot be negative")
     return parsed
+
+
+def _bounded_list_limit(limit: int) -> int:
+    return min(max(limit, 1), 200)
 
 
 def _optional_int_query_value(

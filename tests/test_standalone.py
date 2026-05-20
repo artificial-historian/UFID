@@ -35,6 +35,8 @@ class StandaloneToolTests(unittest.TestCase):
         self.assertTrue((web_root / "app.js").is_file())
         self.assertTrue((web_root / "files.html").is_file())
         self.assertTrue((web_root / "files.js").is_file())
+        self.assertTrue((web_root / "goldrush.html").is_file())
+        self.assertTrue((web_root / "goldrush.js").is_file())
         self.assertTrue((web_root / "styles.css").is_file())
 
     def test_web_assets_are_packaged_under_ufid(self) -> None:
@@ -44,6 +46,8 @@ class StandaloneToolTests(unittest.TestCase):
         self.assertTrue(package_root.joinpath("app.js").is_file())
         self.assertTrue(package_root.joinpath("files.html").is_file())
         self.assertTrue(package_root.joinpath("files.js").is_file())
+        self.assertTrue(package_root.joinpath("goldrush.html").is_file())
+        self.assertTrue(package_root.joinpath("goldrush.js").is_file())
         self.assertTrue(package_root.joinpath("styles.css").is_file())
         self.assertTrue(package_root.joinpath("assets", "ufid-mark.svg").is_file())
 

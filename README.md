@@ -1,4 +1,4 @@
-# UFID: Universal File Identification Database
+# UFID: Universal File Identity Database
 
 UFID is a file identity system for computing, storing, searching, and enriching
 multi-algorithm file hashsets.
@@ -7,7 +7,7 @@ This repository currently contains runnable Python local applications that
 establish the core behavior and data model. The backend target is PostgreSQL,
 with SQLite available for local/offline use.
 
-Current release target: `0.5.0rc1`.
+Current release target: `0.6.0rc1`.
 
 ## Components
 
@@ -22,7 +22,8 @@ Current release target: `0.5.0rc1`.
   their bytes, add them to UFID, and inspect supported archive contents.
 - `ufid-server`: local HTTP API backed by SQLite for prototype use.
 - `ufid-pg-server`: HTTP API backed by PostgreSQL for deployment behind nginx.
-- `web/`: static browser interface with drag-and-drop client-side hashing.
+- `web/`: static browser interface with drag-and-drop client-side hashing,
+  known-file browsing, and Goldrush hash monitoring.
 - `docs/database.postgres.sql`: PostgreSQL schema for the backend target.
 
 ## Quick Start
@@ -73,8 +74,12 @@ download/analyze queue separately:
 
 ```powershell
 ufid ia-ingest --mode metadata --collection software
-ufid ia-ingest --mode download --backend http://127.0.0.1:8765
+ufid ia-ingest --mode download --backend http://127.0.0.1:8765 --min-size 1M --max-size 2G
 ```
+
+Download mode processes clearly supported archive files by default. Use
+`--deep-discover-archives` when you deliberately want to download and analyze
+non-archive queue rows that still need byte-level identity.
 
 On Windows, for a local SQLite-only discovery run that starts the web/API server
 and then runs IA metadata discovery in the foreground:
@@ -153,3 +158,7 @@ fully local SQLite setup, see [docs/local-sqlite.md](docs/local-sqlite.md). For
 a PostgreSQL deployment behind nginx, see
 [docs/deploy-nginx-postgres.md](docs/deploy-nginx-postgres.md) and
 [deploy/postgres/README.md](deploy/postgres/README.md).
+
+## Disclaimer
+
+This software is built in collaboration with the Codex AI assistant.

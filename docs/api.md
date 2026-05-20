@@ -170,6 +170,82 @@ When no record exists:
 { "found": false }
 ```
 
+## Browse File Records
+
+```http
+GET /api/v1/files?limit=200&offset=0&sort=id&direction=desc&q=<filter>
+Authorization: Bearer <token>
+```
+
+`limit` is capped at 200. `sort` can be `id`, `name`, `size`, `crc32`, `md5`,
+`sha1`, `sha256`, or `blake3`; `direction` can be `asc` or `desc`.
+
+Returns:
+
+```json
+{
+  "files": [],
+  "limit": 200,
+  "offset": 0,
+  "count": 0,
+  "total_count": 0,
+  "sort": "id",
+  "direction": "desc",
+  "next_offset": null
+}
+```
+
+## Goldrush Alerts
+
+```http
+POST /api/v1/goldrush/alerts
+Content-Type: application/json
+Authorization: Bearer <token>
+```
+
+Creates a monitoring alert. `name`, `description`, and at least one supported
+hash are required. `size_bytes` is optional; when present it must match the UFID
+file size for a hit to be reported.
+
+```json
+{
+  "name": "Goldrush Set",
+  "description": "Logiqx DAT or manual context",
+  "size_bytes": 1234,
+  "hashes": {
+    "crc32": "12345678",
+    "md5": "0123456789abcdef0123456789abcdef",
+    "sha1": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
+```
+
+```http
+POST /api/v1/goldrush/import-dat
+Content-Type: application/json
+Authorization: Bearer <token>
+```
+
+Imports Logiqx DAT files in XML or classic text syntax. Imported rows use the
+set name as the alert name and the DAT header name as the alert description.
+
+```json
+{
+  "filename": "example.dat",
+  "text": "<datafile>...</datafile>"
+}
+```
+
+```http
+GET /api/v1/goldrush/alerts?limit=200&offset=0&q=<filter>
+GET /api/v1/goldrush/matches?limit=200&offset=0&q=<filter>
+Authorization: Bearer <token>
+```
+
+The matches endpoint returns existing UFID records whose stored hashes match a
+Goldrush alert. If the alert has `size_bytes`, the UFID record must match that
+exact size as well.
+
 ## Add Or Enrich File Identity
 
 ```http
@@ -326,7 +402,11 @@ The local and PostgreSQL servers serve packaged web assets by default:
 
 ```http
 GET /
+GET /files.html
+GET /goldrush.html
 GET /app.js
+GET /files.js
+GET /goldrush.js
 GET /styles.css
 ```
 

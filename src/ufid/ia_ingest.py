@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import os
 from pathlib import Path, PurePosixPath
+import re
 import sys
 from typing import Any, Mapping
 
@@ -17,7 +18,11 @@ from ufid.add import (
     add_archive_contents_to_backend,
     add_archive_contents_to_local,
 )
-from ufid.archives import looks_like_archive_path
+from ufid.archives import (
+    looks_like_archive_path,
+    looks_like_single_file_compression_path,
+    looks_like_supported_archive_container_path,
+)
 from ufid.database import (
     IdentityConflict,
     add_file_metadata,
@@ -123,12 +128,15 @@ class IngestOptions:
     max_items: int | None
     max_files: int | None
     max_file_bytes: int | None
+    min_size_bytes: int | None
+    max_size_bytes: int | None
     original_only: bool
     skip_metadata_files: bool
     keep_cache: bool
     retry_failed: bool
     dry_run: bool
     no_archive_scan: bool
+    deep_discover_archives: bool
     allow_checksum_mismatch: bool
     discover_collections: bool
     max_collection_depth: int
@@ -448,6 +456,8 @@ class IAIngestRunner:
                     ),
                     ufid_file_id=queued_file.ufid_file_id,
                 )
+                continue
+            if self._should_defer_download(queued_file, ia_file):
                 continue
             try:
                 self._process_file(queued_file.item_identifier, ia_file, queued_file)
@@ -951,12 +961,18 @@ class IAIngestRunner:
             needs_downloaded_identity=queued_file.needs_downloaded_identity,
             identity_metadata_missing=",".join(queued_file.identity_metadata_missing),
         )
-        download = self.client.download_file(
-            identifier=identifier,
-            ia_file=ia_file,
-            destination=destination,
-            resume=True,
-        )
+        progress_bar = self._download_progress_bar(ia_file)
+        try:
+            download = self.client.download_file(
+                identifier=identifier,
+                ia_file=ia_file,
+                destination=destination,
+                resume=True,
+                progress_callback=None if progress_bar is None else progress_bar.update,
+            )
+        finally:
+            if progress_bar is not None:
+                progress_bar.finish()
 
         hash_result = compute_file_hashes(download.path, algorithms=self.options.algorithms)
         if not self.options.allow_checksum_mismatch:
@@ -1073,6 +1089,67 @@ class IAIngestRunner:
             return True
         return False
 
+    def _should_defer_download(
+        self,
+        queued_file: QueuedFile,
+        ia_file: IAFile,
+    ) -> bool:
+        if (
+            self.options.min_size_bytes is not None
+            and (
+                ia_file.size is None
+                or ia_file.size < self.options.min_size_bytes
+            )
+        ):
+            self.stats.skipped_files += 1
+            size_text = "unknown" if ia_file.size is None else str(ia_file.size)
+            self._progress(
+                "info",
+                "download_deferred",
+                (
+                    f"Deferred IA file {queued_file.item_identifier}/{queued_file.name}: "
+                    f"size {size_text} is below --min-size {self.options.min_size_bytes}"
+                ),
+                size_bytes=ia_file.size,
+                min_size_bytes=self.options.min_size_bytes,
+            )
+            return True
+
+        if (
+            self.options.max_size_bytes is not None
+            and ia_file.size is not None
+            and ia_file.size > self.options.max_size_bytes
+        ):
+            self.stats.skipped_files += 1
+            self._progress(
+                "info",
+                "download_deferred",
+                (
+                    f"Deferred IA file {queued_file.item_identifier}/{queued_file.name}: "
+                    f"size {ia_file.size} exceeds --max-size {self.options.max_size_bytes}"
+                ),
+                size_bytes=ia_file.size,
+                max_size_bytes=self.options.max_size_bytes,
+            )
+            return True
+
+        if (
+            not self.options.deep_discover_archives
+            and not looks_like_supported_archive_container_path(ia_file.name)
+        ):
+            self.stats.skipped_files += 1
+            self._progress(
+                "info",
+                "download_deferred",
+                (
+                    f"Deferred IA file {queued_file.item_identifier}/{queued_file.name}: "
+                    "not a clearly supported archive"
+                ),
+                file_format=ia_file.format,
+            )
+            return True
+        return False
+
     def _requires_download_analysis(
         self,
         queued_file: QueuedFile,
@@ -1082,9 +1159,7 @@ class IAIngestRunner:
             return True
         if self.options.no_archive_scan:
             return False
-        return looks_like_archive_path(ia_file.name) or _looks_like_unsupported_container(
-            ia_file
-        )
+        return _requires_archive_scan(ia_file)
 
     def _remaining_items(self) -> int | None:
         if self.options.max_items is None:
@@ -1122,6 +1197,17 @@ class IAIngestRunner:
             detail_suffix = f" ({compact})"
         line = f"[{level}] {message}{detail_suffix}"
         print(self._colorize_line(level, event, line), flush=True)
+
+    def _download_progress_bar(self, ia_file: IAFile) -> "_DownloadProgressBar | None":
+        if self.options.quiet or self.options.jsonl:
+            return None
+        if not bool(getattr(sys.stdout, "isatty", lambda: False)()):
+            return None
+        return _DownloadProgressBar(
+            label=PurePosixPath(ia_file.name).name,
+            total_bytes=ia_file.size,
+            stream=sys.stdout,
+        )
 
     def _debug(self, event: str, message: str, **details: Any) -> None:
         if not self.options.debug:
@@ -1273,6 +1359,37 @@ def _is_hex(value: str | None, length: int) -> bool:
     return all(character in "0123456789abcdef" for character in text)
 
 
+def parse_size_limit(value: str) -> int:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(?i)(\d+(?:\.\d+)?)\s*([kmgtp]?i?b?|bytes?)?", text)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "size must be a number optionally followed by K, M, G, T, or P"
+        )
+
+    number = float(match.group(1))
+    if number < 0:
+        raise argparse.ArgumentTypeError("size cannot be negative")
+    suffix = (match.group(2) or "b").lower()
+    suffix = suffix.removesuffix("bytes").removesuffix("byte")
+    suffix = suffix.removesuffix("ib").removesuffix("b")
+    suffix = suffix.removesuffix("i")
+    multipliers = {
+        "": 1,
+        "k": 1024,
+        "m": 1024**2,
+        "g": 1024**3,
+        "t": 1024**4,
+        "p": 1024**5,
+    }
+    multiplier = multipliers.get(suffix)
+    if multiplier is None:
+        raise argparse.ArgumentTypeError(
+            "size suffix must be one of K, M, G, T, or P"
+        )
+    return int(number * multiplier)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ufid-ia-ingest",
@@ -1324,12 +1441,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-items", type=int)
     parser.add_argument("--max-files", type=int)
     parser.add_argument("--max-file-bytes", type=int)
+    parser.add_argument(
+        "--min-size",
+        type=parse_size_limit,
+        dest="min_size_bytes",
+        help=(
+            "Defer queued downloads smaller than this size without changing their "
+            "queue status. Accepts byte values plus K, M, G, T, or P suffixes, "
+            "for example 100k, 2M, or 60G."
+        ),
+    )
+    parser.add_argument(
+        "--max-size",
+        type=parse_size_limit,
+        dest="max_size_bytes",
+        help=(
+            "Defer queued downloads larger than this size without changing their "
+            "queue status. Accepts byte values plus K, M, G, T, or P suffixes, "
+            "for example 100k, 2M, or 60G."
+        ),
+    )
     parser.add_argument("--original-only", action="store_true")
     parser.add_argument("--skip-metadata-files", action="store_true")
     parser.add_argument("--keep-cache", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-archive-scan", action="store_true")
+    parser.add_argument(
+        "--deep-discover-archives",
+        action="store_true",
+        help=(
+            "Allow the download worker to process non-archive or unsupported "
+            "container-looking queue rows. By default, download mode only "
+            "downloads clearly supported archive files."
+        ),
+    )
     parser.add_argument("--allow-checksum-mismatch", action="store_true")
     parser.add_argument(
         "--discover-collections",
@@ -1376,6 +1522,12 @@ def options_from_args(args: argparse.Namespace) -> IngestOptions:
     max_collections = (
         None if args.max_collections is None else max(0, int(args.max_collections))
     )
+    if (
+        args.min_size_bytes is not None
+        and args.max_size_bytes is not None
+        and args.min_size_bytes > args.max_size_bytes
+    ):
+        raise ValueError("--min-size cannot be larger than --max-size")
     return IngestOptions(
         mode=args.mode,
         query=query,
@@ -1395,12 +1547,15 @@ def options_from_args(args: argparse.Namespace) -> IngestOptions:
         max_items=args.max_items,
         max_files=args.max_files,
         max_file_bytes=args.max_file_bytes,
+        min_size_bytes=args.min_size_bytes,
+        max_size_bytes=args.max_size_bytes,
         original_only=bool(args.original_only),
         skip_metadata_files=bool(args.skip_metadata_files),
         keep_cache=bool(args.keep_cache),
         retry_failed=bool(args.retry_failed),
         dry_run=bool(args.dry_run),
         no_archive_scan=bool(args.no_archive_scan),
+        deep_discover_archives=bool(args.deep_discover_archives),
         allow_checksum_mismatch=bool(args.allow_checksum_mismatch),
         discover_collections=bool(args.discover_collections),
         max_collection_depth=max(0, int(args.collection_depth)),
@@ -1454,11 +1609,89 @@ def _looks_like_unsupported_container(ia_file: IAFile) -> bool:
     )
 
 
+def _requires_archive_scan(ia_file: IAFile) -> bool:
+    name = ia_file.name
+    return (
+        looks_like_archive_path(name)
+        and not looks_like_single_file_compression_path(name)
+    ) or _looks_like_unsupported_container(ia_file)
+
+
 def _optional_str(value: object) -> str | None:
     if value is None:
         return None
     text = str(value)
     return text if text else None
+
+
+class _DownloadProgressBar:
+    def __init__(
+        self,
+        *,
+        label: str,
+        total_bytes: int | None,
+        stream,
+    ) -> None:
+        self.label = _shorten_progress_label(label)
+        self.total_bytes = total_bytes
+        self.stream = stream
+        self._last_width = 0
+        self._started = False
+
+    def update(self, bytes_written: int, total_bytes: int | None) -> None:
+        total = total_bytes if total_bytes is not None else self.total_bytes
+        line = _format_download_progress(
+            label=self.label,
+            bytes_written=max(0, int(bytes_written)),
+            total_bytes=total,
+        )
+        padding = " " * max(0, self._last_width - len(line))
+        self.stream.write(f"\r{line}{padding}")
+        self.stream.flush()
+        self._last_width = len(line)
+        self._started = True
+
+    def finish(self) -> None:
+        if self._started:
+            self.stream.write("\n")
+            self.stream.flush()
+
+
+def _format_download_progress(
+    *,
+    label: str,
+    bytes_written: int,
+    total_bytes: int | None,
+    width: int = 28,
+) -> str:
+    if total_bytes is not None and total_bytes > 0:
+        ratio = min(max(bytes_written / total_bytes, 0.0), 1.0)
+        filled = min(width, int(round(width * ratio)))
+        bar = "#" * filled + "-" * (width - filled)
+        return (
+            f"  {label} [{bar}] {ratio * 100:5.1f}% "
+            f"{_format_byte_count(bytes_written)}/{_format_byte_count(total_bytes)}"
+        )
+
+    return f"  {label} {_format_byte_count(bytes_written)} downloaded"
+
+
+def _shorten_progress_label(label: str, max_length: int = 36) -> str:
+    text = label or "download"
+    if len(text) <= max_length:
+        return text
+    return "..." + text[-(max_length - 3):]
+
+
+def _format_byte_count(value: int) -> str:
+    amount = float(max(0, value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            if unit == "B":
+                return f"{int(amount)} {unit}"
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TiB"
 
 
 ANSI_COLORS = {
@@ -1486,8 +1719,11 @@ def _ansi(color: str, text: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    options = options_from_args(args)
-    runner = IAIngestRunner(options)
+    try:
+        options = options_from_args(args)
+        runner = IAIngestRunner(options)
+    except ValueError as exc:
+        parser.exit(2, f"ufid-ia-ingest: {exc}\n")
     try:
         runner.run()
     except (IAClientError, api_client.UFIDAPIError, IdentityConflict, ValueError) as exc:

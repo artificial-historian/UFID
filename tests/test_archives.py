@@ -18,6 +18,7 @@ from ufid.add import MAX_NESTED_ARCHIVE_DEPTH, main as add_main
 from ufid.archives import (
     ARCHIVE_SUFFIXES,
     _parse_7z_list_output,
+    is_supported_archive,
     iter_archive_entries,
     iter_archive_payload_entries,
     looks_like_archive_path,
@@ -60,6 +61,8 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue(looks_like_archive_path("game.iso"))
         self.assertTrue(looks_like_archive_path("software.7z"))
         self.assertTrue(looks_like_archive_path("disk.nrg"))
+        self.assertFalse(looks_like_archive_path("crawl.cdx.gz"))
+        self.assertFalse(looks_like_archive_path("crawl.warc.gz"))
 
     def test_single_file_gzip_is_treated_as_archive_member(self) -> None:
         SCRATCH.mkdir(exist_ok=True)
@@ -81,6 +84,22 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].archive_path, "payload.bin")
         self.assertEqual(entries[0].payload, b"nested gzip")
+
+    def test_cdx_and_warc_gzip_are_not_archive_members(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        for suffix in ("cdx.gz", "warc.gz"):
+            path = SCRATCH / f"crawl-{uuid.uuid4().hex}.{suffix}"
+            path.write_bytes(gzip.compress(b"compressed crawl data"))
+
+            self.assertFalse(is_supported_archive(path))
+            self.assertEqual(iter_archive_entries(path), [])
+            self.assertEqual(
+                iter_archive_payload_entries(
+                    gzip.compress(b"nested compressed crawl data"),
+                    name_hint=f"nested/crawl.{suffix}",
+                ),
+                [],
+            )
 
     def test_7z_technical_listing_parser_handles_files_dirs_and_encryption(self) -> None:
         listing = """

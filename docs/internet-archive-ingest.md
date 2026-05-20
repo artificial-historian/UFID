@@ -104,14 +104,39 @@ This mode:
 - reads queued file rows from the state DB;
 - does not call IA Scrape API;
 - does not refetch IA item metadata;
-- downloads file bytes from the queued stable IA URL when needed for a missing
-  parent identity or archive/container analysis;
+- by default, downloads file bytes only for queue rows that are clearly
+  supported archive files;
 - computes UFID hashes locally;
 - checks IA-declared fixity by default;
 - inserts/enriches UFID when a queue row is marked `needs_downloaded_identity`
   because the IA metadata record was not sufficient on its own;
 - skips downloads for complete, already-stored IA API identities that do not
   look like archives or containers.
+
+Queue rows that need byte-level identity but are not clearly supported archive
+files are left pending. Process those broader rows explicitly with:
+
+```powershell
+ufid ia-ingest `
+  --mode download `
+  --backend https://ufid.example.com `
+  --deep-discover-archives
+```
+
+To leave small or large queue rows untouched during a controlled pass, use
+`--min-size` and/or `--max-size`. The suffixes use powers of 1024:
+
+```powershell
+ufid ia-ingest `
+  --mode download `
+  --backend https://ufid.example.com `
+  --min-size 1M `
+  --max-size 2G
+```
+
+Rows smaller than `--min-size`, rows with unknown IA metadata size when
+`--min-size` is set, and rows larger than `--max-size` are not marked `skipped`
+or `failed`; a later run without those limits will still find them pending.
 
 Combined mode:
 
@@ -129,8 +154,12 @@ Use a descriptive Internet Archive User-Agent:
 ufid ia-ingest `
   --backend https://ufid.example.com `
   --collection software `
-  --user-agent "UFID-IA-Ingest/0.5.0rc1 (gpt-5; contact: you@example.com)"
+  --user-agent "UFID-IA-Ingest/0.6.0rc1 (gpt-5; contact: you@example.com)"
 ```
+
+Do not use browser-spoofed or stealth User-Agent strings. A clear tool name and
+contact is better operationally and makes access-control or rate-limit problems
+diagnosable.
 
 ## Resume And Retry
 
@@ -176,7 +205,12 @@ Tuning flags:
 
 ## File Selection
 
-By default, the tool attempts every file listed in IA metadata.
+Download mode only downloads rows that need byte-level identity or archive
+analysis. Rows whose IA metadata already provided a complete UFID identity are
+marked done without download unless they are archive containers that need
+member expansion. Plain single-file compression derivatives such as
+`*_hocr.html.gz` are not archive-scan candidates by default. Crawl index/data
+files ending in `.cdx.gz` or `.warc.gz` are always treated as non-archive files.
 
 Useful limiting flags:
 
@@ -184,6 +218,8 @@ Useful limiting flags:
 --original-only
 --skip-metadata-files
 --max-file-bytes 1073741824
+--min-size 1M
+--max-size 2G
 --max-items 100
 --max-files 1000
 ```
@@ -235,6 +271,10 @@ Use that only for forensic/manual reconciliation runs.
 ## Progress
 
 Human-readable progress is printed by default.
+During interactive download runs, each active file download also renders a
+single-line progress bar with bytes written and percentage when IA metadata
+includes the file size. The progress bar is not emitted for `--jsonl`, `--quiet`,
+or non-interactive output redirection.
 
 For step-by-step metadata queue details, including each IA file row's declared
 size, `crc32`, `md5`, and `sha1` values captured from the IA API:

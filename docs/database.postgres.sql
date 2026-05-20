@@ -146,6 +146,51 @@ CREATE TABLE IF NOT EXISTS ufid_file_source (
     PRIMARY KEY (file_id, source_id, external_reference)
 );
 
+CREATE TABLE IF NOT EXISTS ufid_goldrush_alert (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    description TEXT NOT NULL CHECK (length(trim(description)) > 0),
+    size_bytes BIGINT CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    crc32 TEXT CHECK (crc32 IS NULL OR crc32 ~ '^[0-9a-f]{8}$'),
+    md5 TEXT CHECK (md5 IS NULL OR md5 ~ '^[0-9a-f]{32}$'),
+    sha1 TEXT CHECK (sha1 IS NULL OR sha1 ~ '^[0-9a-f]{40}$'),
+    sha256 TEXT CHECK (sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'),
+    blake3 TEXT CHECK (blake3 IS NULL OR blake3 ~ '^[0-9a-f]{64}$'),
+    source_type TEXT,
+    source_name TEXT,
+    source_detail TEXT,
+    fingerprint TEXT NOT NULL UNIQUE CHECK (length(trim(fingerprint)) > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        crc32 IS NOT NULL
+        OR md5 IS NOT NULL
+        OR sha1 IS NOT NULL
+        OR sha256 IS NOT NULL
+        OR blake3 IS NOT NULL
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_crc32
+    ON ufid_goldrush_alert (crc32);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_md5
+    ON ufid_goldrush_alert (md5);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_sha1
+    ON ufid_goldrush_alert (sha1);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_sha256
+    ON ufid_goldrush_alert (sha256);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_blake3
+    ON ufid_goldrush_alert (blake3);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_size
+    ON ufid_goldrush_alert (size_bytes);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_alert_source
+    ON ufid_goldrush_alert (source_name);
+
 CREATE TABLE IF NOT EXISTS ufid_user_account (
     id BIGSERIAL PRIMARY KEY,
     username TEXT NOT NULL UNIQUE CHECK (

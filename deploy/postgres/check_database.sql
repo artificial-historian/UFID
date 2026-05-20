@@ -10,6 +10,8 @@ SELECT 'ufid_source', count(*) FROM ufid_source
 UNION ALL
 SELECT 'ufid_file_source', count(*) FROM ufid_file_source
 UNION ALL
+SELECT 'ufid_goldrush_alert', count(*) FROM ufid_goldrush_alert
+UNION ALL
 SELECT 'ufid_user_account', count(*) FROM ufid_user_account
 UNION ALL
 SELECT 'ufid_role', count(*) FROM ufid_role

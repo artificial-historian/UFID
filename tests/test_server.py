@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ufid.server import UFIDRequestHandler, _coerce_metadata_payload
 from ufid.database import connect, create_user
+from ufid.goldrush import parse_logiqx_dat
 from ufid import add, lookup
 from ufid.paths import default_user_data_dir
 
@@ -128,6 +129,201 @@ class ServerTests(unittest.TestCase):
             "encrypted.zip: encrypted member",
             [item["value"] for item in loaded_with_archive["file"]["metadata"]],
         )
+
+    def test_file_list_supports_pagination_filtering_and_sorting(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"server-list-{uuid.uuid4().hex}.sqlite"
+        self._create_test_user(db_path)
+        handler_class = type(
+            "TestUFIDListRequestHandler",
+            (UFIDRequestHandler,),
+            {"db_path": db_path, "web_root": ROOT / "web"},
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+        try:
+            token = self._login(base_url)
+            for index, (name, size) in enumerate(
+                [("beta.bin", 30), ("alpha.bin", 10), ("gamma.bin", 20)],
+                start=1,
+            ):
+                self._post_json(
+                    f"{base_url}/api/v1/files",
+                    {
+                        "display_name": name,
+                        "size_bytes": size,
+                        "hashes": {
+                            "crc32": f"{index:08x}",
+                            "md5": f"{index:032x}",
+                            "sha1": f"{index:040x}",
+                        },
+                    },
+                    token=token,
+                )
+
+            page_one = self._get_json(
+                f"{base_url}/api/v1/files?limit=2&sort=name&direction=asc",
+                token=token,
+            )
+            page_two = self._get_json(
+                f"{base_url}/api/v1/files?limit=2&offset=2&sort=name&direction=asc",
+                token=token,
+            )
+            filtered = self._get_json(
+                f"{base_url}/api/v1/files?q=beta&sort=size&direction=desc",
+                token=token,
+            )
+            by_size = self._get_json(
+                f"{base_url}/api/v1/files?limit=3&sort=size&direction=desc",
+                token=token,
+            )
+            with self.assertRaises(HTTPError) as raised:
+                self._get_json(f"{base_url}/api/v1/files?sort=unsupported", token=token)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(page_one["total_count"], 3)
+        self.assertEqual(page_one["next_offset"], 2)
+        self.assertEqual([item["display_name"] for item in page_one["files"]], ["alpha.bin", "beta.bin"])
+        self.assertIsNone(page_two["next_offset"])
+        self.assertEqual([item["display_name"] for item in page_two["files"]], ["gamma.bin"])
+        self.assertEqual(filtered["total_count"], 1)
+        self.assertEqual(filtered["files"][0]["display_name"], "beta.bin")
+        self.assertEqual([item["size_bytes"] for item in by_size["files"]], [30, 20, 10])
+        self.assertEqual(raised.exception.code, 400)
+        raised.exception.close()
+
+    def test_goldrush_alerts_dat_import_and_matches(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"server-goldrush-{uuid.uuid4().hex}.sqlite"
+        self._create_test_user(db_path)
+        handler_class = type(
+            "TestUFIDGoldrushRequestHandler",
+            (UFIDRequestHandler,),
+            {"db_path": db_path, "web_root": ROOT / "web"},
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+        try:
+            token = self._login(base_url)
+            created_file = self._post_json(
+                f"{base_url}/api/v1/files",
+                {
+                    "display_name": "goldrush-target.bin",
+                    "size_bytes": 5,
+                    "hashes": {
+                        "crc32": "11111111",
+                        "md5": "a" * 32,
+                        "sha1": "b" * 40,
+                        "sha256": "c" * 64,
+                    },
+                },
+                token=token,
+            )
+            manual_alert = self._post_json(
+                f"{base_url}/api/v1/goldrush/alerts",
+                {
+                    "name": "Manual target",
+                    "description": "Manual watch entry",
+                    "size_bytes": 5,
+                    "hashes": {"md5": "a" * 32},
+                },
+                token=token,
+            )
+            xml_dat = f"""<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>Goldrush Test DAT</name>
+    <description>Goldrush Test Description</description>
+  </header>
+  <game name="Goldrush Set">
+    <description>Goldrush Set Description</description>
+    <rom name="goldrush-target.bin" size="5" crc="11111111" md5="{'a' * 32}" sha1="{'b' * 40}" />
+  </game>
+</datafile>
+"""
+            dat_import = self._post_json(
+                f"{base_url}/api/v1/goldrush/import-dat",
+                {"filename": "goldrush-test.dat", "text": xml_dat},
+                token=token,
+            )
+            alerts = self._get_json(
+                f"{base_url}/api/v1/goldrush/alerts?q=Goldrush",
+                token=token,
+            )
+            manual_matches = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches?q=Manual",
+                token=token,
+            )
+            dat_matches = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches?q=Goldrush%20Set",
+                token=token,
+            )
+            with self.assertRaises(HTTPError) as raised:
+                self._post_json(
+                    f"{base_url}/api/v1/goldrush/alerts",
+                    {
+                        "name": "Invalid",
+                        "description": "Missing hashes",
+                        "hashes": {},
+                    },
+                    token=token,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(created_file["created"], True)
+        self.assertTrue(manual_alert["created"])
+        self.assertEqual(manual_alert["alert"]["hashes"]["md5"], "a" * 32)
+        self.assertEqual(dat_import["source_name"], "Goldrush Test DAT")
+        self.assertEqual(dat_import["parsed"], 1)
+        self.assertEqual(dat_import["created"], 1)
+        self.assertEqual(alerts["total_count"], 1)
+        self.assertEqual(alerts["alerts"][0]["name"], "Goldrush Set")
+        self.assertEqual(alerts["alerts"][0]["description"], "Goldrush Test DAT")
+        self.assertEqual(manual_matches["total_count"], 1)
+        self.assertEqual(manual_matches["matches"][0]["file"]["id"], created_file["id"])
+        self.assertEqual(manual_matches["matches"][0]["matched_algorithms"], ["md5"])
+        self.assertEqual(dat_matches["total_count"], 1)
+        self.assertEqual(
+            dat_matches["matches"][0]["matched_algorithms"],
+            ["crc32", "md5", "sha1"],
+        )
+        self.assertTrue(dat_matches["matches"][0]["size_matched"])
+        self.assertEqual(raised.exception.code, 400)
+        raised.exception.close()
+
+    def test_classic_logiqx_dat_parser(self) -> None:
+        summary = parse_logiqx_dat(
+            """
+clrmamepro (
+  name "Classic DAT"
+  description "Classic DAT Description"
+)
+game (
+  name "Classic Set"
+  rom ( name "classic.bin" size 7 crc 22222222 md5 dddddddddddddddddddddddddddddddd sha1 eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee )
+)
+"""
+        )
+
+        self.assertEqual(summary.source_name, "Classic DAT")
+        self.assertEqual(len(summary.alerts), 1)
+        alert = summary.alerts[0]
+        self.assertEqual(alert["name"], "Classic Set")
+        self.assertEqual(alert["description"], "Classic DAT")
+        self.assertEqual(alert["source_detail"], "classic.bin")
+        self.assertEqual(alert["hashes"]["crc32"], "22222222")
 
     def test_server_reports_optional_hash_conflict_payload(self) -> None:
         SCRATCH.mkdir(exist_ok=True)

@@ -77,6 +77,36 @@ ARCHIVE_SUFFIXES = (
     ".z",
     ".br",
 )
+BUILTIN_ARCHIVE_SUFFIXES = (
+    ".zip",
+    ".zipx",
+    ".jar",
+    ".war",
+    ".ear",
+    ".apk",
+    ".xpi",
+    ".crx",
+    ".tar",
+    ".tgz",
+    ".tar.gz",
+    ".tbz2",
+    ".tar.bz2",
+    ".txz",
+    ".tar.xz",
+    ".tzst",
+    ".tar.zst",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".lzma",
+    ".zst",
+    ".z",
+    ".br",
+)
+NON_ARCHIVE_SUFFIXES = (
+    ".cdx.gz",
+    ".warc.gz",
+)
 COMPOUND_ARCHIVE_SUFFIXES = tuple(
     sorted((suffix for suffix in ARCHIVE_SUFFIXES if suffix.count(".") > 1), key=len, reverse=True)
 )
@@ -88,11 +118,37 @@ EXTERNAL_EXTRACT_TIMEOUT_SECONDS = 300
 def looks_like_archive_path(path: str | Path | None) -> bool:
     if path is None:
         return False
-    return str(path).lower().endswith(ARCHIVE_SUFFIXES)
+    return _archive_suffix(str(path)) in ARCHIVE_SUFFIXES
+
+
+def looks_like_supported_archive_path(path: str | Path | None) -> bool:
+    if path is None:
+        return False
+    suffix = _archive_suffix(str(path))
+    if suffix in BUILTIN_ARCHIVE_SUFFIXES:
+        return True
+    return looks_like_archive_path(path) and _external_extractor_available()
+
+
+def looks_like_single_file_compression_path(path: str | Path | None) -> bool:
+    if path is None:
+        return False
+    suffix = _archive_suffix(str(path))
+    return suffix in SINGLE_FILE_COMPRESSION_SUFFIXES
+
+
+def looks_like_supported_archive_container_path(path: str | Path | None) -> bool:
+    if path is None:
+        return False
+    if looks_like_single_file_compression_path(path):
+        return False
+    return looks_like_supported_archive_path(path)
 
 
 def is_supported_archive(path: str | Path) -> bool:
     file_path = Path(path)
+    if _looks_like_non_archive_path(file_path):
+        return False
     return (
         _is_zip_path(file_path)
         or _is_tar_path(file_path)
@@ -107,6 +163,9 @@ def is_supported_archive_payload(payload: bytes) -> bool:
 
 def iter_archive_entries(path: str | Path, name_hint: str | None = None) -> list[ArchiveEntry]:
     file_path = Path(path)
+    if _looks_like_non_archive_path(file_path):
+        return []
+
     if _is_zip_path(file_path):
         stdlib_entries: list[ArchiveEntry]
         try:
@@ -152,6 +211,8 @@ def iter_archive_payload_entries(
     payload: bytes,
     name_hint: str | None = None,
 ) -> list[ArchiveEntry]:
+    if _looks_like_non_archive_path(name_hint):
+        return []
     if _is_zip_payload(payload):
         return list(_iter_zip_entries(BytesIO(payload)))
     if _is_tar_payload(payload):
@@ -680,6 +741,8 @@ def _is_single_compressed_path(path: Path) -> bool:
 
 
 def _looks_like_single_compressed_name(name: str | None) -> bool:
+    if _looks_like_non_archive_path(name):
+        return False
     return _single_compression_suffix(name or "") in SINGLE_FILE_COMPRESSION_SUFFIXES
 
 
@@ -744,10 +807,18 @@ def _command_candidates(directory: Path, command: str) -> list[Path]:
 
 def _archive_suffix(name: str) -> str:
     lower = name.lower()
+    if _looks_like_non_archive_path(lower):
+        return ""
     for suffix in COMPOUND_ARCHIVE_SUFFIXES:
         if lower.endswith(suffix):
             return suffix
     return Path(name).suffix
+
+
+def _looks_like_non_archive_path(path: str | Path | None) -> bool:
+    if path is None:
+        return False
+    return str(path).lower().endswith(NON_ARCHIVE_SUFFIXES)
 
 
 def _optional_int(value: str | None) -> int | None:
