@@ -31,6 +31,7 @@ from ufid.database import (
     get_file,
     import_goldrush_alerts,
     list_goldrush_alerts,
+    list_goldrush_alert_sources,
     list_files,
     list_goldrush_matches,
     revoke_session,
@@ -96,6 +97,11 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             if not self._require_role("reader"):
                 return
             self._handle_list_goldrush_alerts(parsed.query)
+            return
+        if parsed.path == "/api/v1/goldrush/alert-sources":
+            if not self._require_role("reader"):
+                return
+            self._handle_list_goldrush_alert_sources()
             return
         if parsed.path == "/api/v1/goldrush/matches":
             if not self._require_role("reader"):
@@ -347,6 +353,11 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             }
         )
 
+    def _handle_list_goldrush_alert_sources(self) -> None:
+        with self._connect() as connection:
+            sources = list_goldrush_alert_sources(connection)
+        self._write_json({"sources": sources, "count": len(sources)})
+
     def _handle_list_goldrush_matches(self, query: str) -> None:
         params = parse_qs(query)
         try:
@@ -357,14 +368,24 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             return
 
         search = _single_query_value(params, "q")
+        source_keys = tuple(
+            value.strip()
+            for value in params.get("source_key", [])
+            if value.strip()
+        )
         with self._connect() as connection:
             matches = list_goldrush_matches(
                 connection,
                 limit=limit,
                 offset=offset,
                 query=search,
+                source_keys=source_keys,
             )
-            total_count = count_goldrush_matches(connection, query=search)
+            total_count = count_goldrush_matches(
+                connection,
+                query=search,
+                source_keys=source_keys,
+            )
         self._write_json(
             {
                 "matches": matches,
@@ -578,6 +599,18 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_unexpected_error(self, exc: Exception) -> None:
+        if _is_sqlite_busy_error(exc):
+            LOGGER.warning("SQLite database busy while handling %s: %s", self.path, exc)
+            try:
+                self._write_json(
+                    {"error": "SQLite database is busy; retry shortly"},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    headers=[("Retry-After", "1")],
+                )
+            except Exception:
+                raise exc
+            return
+
         LOGGER.exception("Unhandled UFID server error while handling %s", self.path)
         try:
             self._write_json(
@@ -771,6 +804,17 @@ def _user_has_role(user_roles: Sequence[str], required: str) -> bool:
         "admin": {"admin"},
     }
     return bool(set(user_roles) & grants[required])
+
+
+def _is_sqlite_busy_error(exc: Exception) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return (
+        "database is locked" in message
+        or "database is busy" in message
+        or "database table is locked" in message
+    )
 
 
 def _public_user_dict(user: Mapping[str, Any]) -> dict[str, Any]:

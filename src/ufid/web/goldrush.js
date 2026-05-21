@@ -16,10 +16,15 @@ const state = {
   matchesFilter: "",
   alertsRequestId: 0,
   matchesRequestId: 0,
+  matchesLoadingStartedAt: 0,
+  sourceOptions: [],
+  selectedSourceKeys: [],
+  loadingSources: false,
 };
 
 let alertsFilterTimer = null;
 let matchesFilterTimer = null;
+let matchesLoadingTimer = null;
 
 const apiStatus = document.querySelector("#apiStatus");
 const alertDescription = document.querySelector("#alertDescription");
@@ -57,6 +62,7 @@ const matchesPanel = document.querySelector("#matchesPanel");
 const matchesPreviousButton = document.querySelector("#matchesPreviousButton");
 const matchesSummary = document.querySelector("#matchesSummary");
 const matchesTable = document.querySelector("#matchesTable");
+const matchSourceFilters = document.querySelector("#matchSourceFilters");
 const refreshAlertsButton = document.querySelector("#refreshAlertsButton");
 const refreshMatchesButton = document.querySelector("#refreshMatchesButton");
 const sessionPanel = document.querySelector("#sessionPanel");
@@ -147,23 +153,54 @@ matchesPageNumberList.addEventListener("click", async (event) => {
   await goToMatchesPage(Number(button.dataset.page || "1"));
 });
 
+if (matchSourceFilters) {
+  matchSourceFilters.addEventListener("click", async (event) => {
+    const button = event.target?.closest?.("[data-source-key]");
+    if (!button || state.loadingMatches || state.loadingSources) {
+      return;
+    }
+    const key = button.dataset.sourceKey || "";
+    if (!key) {
+      if (!state.selectedSourceKeys.length) {
+        return;
+      }
+      state.selectedSourceKeys = [];
+    } else {
+      const selected = new Set(state.selectedSourceKeys);
+      if (selected.has(key)) {
+        selected.delete(key);
+      } else {
+        selected.add(key);
+      }
+      state.selectedSourceKeys = [...selected];
+    }
+    state.matchesPage = 1;
+    renderSourceFilters();
+    await loadMatches();
+  });
+}
+
 async function checkApi() {
   try {
     await fetchJson("/health", undefined, "API unavailable");
-    apiStatus.textContent = "API online";
-    apiStatus.className = "status ok";
-    await loadSession();
-    if (state.user) {
-      await loadAlerts();
-    } else {
-      renderAlertsMessage("Log in to manage Goldrush alerts.");
-      renderMatchesMessage("Log in to view Goldrush matches.");
-      setGoldrushState("Login required", "warn");
-    }
   } catch {
     apiStatus.textContent = "API offline";
     apiStatus.className = "status error";
     setGoldrushState("API offline", "error");
+    return;
+  }
+
+  apiStatus.textContent = "API online";
+  apiStatus.className = "status ok";
+  await loadSession();
+  if (state.user) {
+    await loadAlertSources();
+    await loadAlerts();
+  } else {
+    renderSourceFilters();
+    renderAlertsMessage("Log in to manage Goldrush alerts.");
+    renderMatchesMessage("Log in to view Goldrush matches.");
+    setGoldrushState("Login required", "warn");
   }
 }
 
@@ -188,6 +225,7 @@ async function login() {
     state.matchesPage = 1;
     renderSession();
     setGoldrushState(`Logged in as ${state.user.username}`, "ok");
+    await loadAlertSources();
     await loadAlerts();
     if (state.activeTab === "matches") {
       await loadMatches();
@@ -216,7 +254,10 @@ async function logout() {
   state.matchesPage = 1;
   state.alertsTotal = 0;
   state.matchesTotal = 0;
+  state.sourceOptions = [];
+  state.selectedSourceKeys = [];
   renderSession();
+  renderSourceFilters();
   renderAlertsMessage("Log in to manage Goldrush alerts.");
   renderMatchesMessage("Log in to view Goldrush matches.");
   setGoldrushState("Logged out", "quiet");
@@ -276,6 +317,7 @@ async function addAlert() {
       setGoldrushState("Alert already existed", "quiet");
     }
     await loadAlerts();
+    await loadAlertSources();
     state.matchesPage = 1;
     if (state.activeTab === "matches") {
       await loadMatches();
@@ -317,6 +359,7 @@ async function importDat() {
     state.alertsPage = 1;
     state.matchesPage = 1;
     await loadAlerts();
+    await loadAlertSources();
     if (state.activeTab === "matches") {
       await loadMatches();
     }
@@ -324,6 +367,31 @@ async function importDat() {
     setImportState(error.message, "error");
   } finally {
     importDatButton.disabled = false;
+    renderSession();
+  }
+}
+
+async function loadAlertSources() {
+  if (!state.user) {
+    state.sourceOptions = [];
+    state.selectedSourceKeys = [];
+    renderSourceFilters();
+    return;
+  }
+
+  state.loadingSources = true;
+  renderSourceFilters();
+  try {
+    const body = await fetchJson("/api/v1/goldrush/alert-sources", undefined, "Load alert sources failed");
+    state.sourceOptions = body.sources || [];
+    const validKeys = new Set(state.sourceOptions.map((source) => source.source_key).filter(Boolean));
+    state.selectedSourceKeys = state.selectedSourceKeys.filter((key) => validKeys.has(key));
+    renderSourceFilters();
+  } catch (error) {
+    setGoldrushState(error.message, "error");
+  } finally {
+    state.loadingSources = false;
+    renderSourceFilters();
     renderSession();
   }
 }
@@ -386,8 +454,9 @@ async function loadMatches() {
   const requestId = state.matchesRequestId + 1;
   state.matchesRequestId = requestId;
   state.loadingMatches = true;
+  state.matchesLoadingStartedAt = performance.now();
   renderSession();
-  renderMatchesMessage("Loading matches.");
+  startMatchesLoadingFeedback(requestId);
 
   const params = new URLSearchParams({
     limit: String(PAGE_LIMIT),
@@ -396,6 +465,9 @@ async function loadMatches() {
   if (state.matchesFilter) {
     params.set("q", state.matchesFilter);
   }
+  state.selectedSourceKeys.forEach((key) => {
+    params.append("source_key", key);
+  });
 
   try {
     const body = await fetchJson(`/api/v1/goldrush/matches?${params.toString()}`, undefined, "Load matches failed");
@@ -418,6 +490,7 @@ async function loadMatches() {
     setGoldrushState(error.message, "error");
   } finally {
     if (requestId === state.matchesRequestId) {
+      stopMatchesLoadingFeedback();
       state.loadingMatches = false;
       renderSession();
     }
@@ -456,15 +529,18 @@ function renderAlertRow(alert) {
 }
 
 function renderMatches() {
+  const filtering = Boolean(state.matchesFilter || state.selectedSourceKeys.length);
   if (!state.matchesTotal) {
-    renderMatchesMessage(state.matchesFilter ? "No matching UFID hits." : "No UFID hits.");
-    setGoldrushState(state.matchesFilter ? "0 matching hits" : "0 hits", state.matchesFilter ? "warn" : "quiet");
+    renderMatchesMessage(filtering ? "No matching UFID hits." : "No UFID hits.");
+    setGoldrushState(filtering ? "0 matching hits" : "0 hits", filtering ? "warn" : "quiet");
     return;
   }
   matchesTable.innerHTML = state.matches.map(renderMatchRow).join("");
   const start = (state.matchesPage - 1) * PAGE_LIMIT + 1;
   const end = start + state.matches.length - 1;
-  setGoldrushState(`${start}-${end} of ${state.matchesTotal} hits`, "ok");
+  const sourceSummary = selectedSourceSummary();
+  const suffix = sourceSummary ? ` from ${sourceSummary}` : "";
+  setGoldrushState(`${start}-${end} of ${state.matchesTotal} hits${suffix}`, "ok");
   renderMatchPagination();
 }
 
@@ -483,6 +559,7 @@ function renderMatchRow(match) {
         <span class="meta-type">${escapeHtml(file.display_name || "")}</span>
         <span class="meta-type">${escapeHtml(formatBytes(file.size_bytes))}</span>
       </td>
+      <td class="ia-link-cell">${renderIaItemLink(file.internet_archive, file.id)}</td>
       <td>
         <div class="chip-list">
           ${matched.map((algorithm) => `<span class="chip">${escapeHtml(algorithm)}</span>`).join("")}
@@ -510,14 +587,129 @@ function renderHashList(hashes, highlights = []) {
   return rows.length ? `<div class="hash-list">${rows.join("")}</div>` : "";
 }
 
+function renderIaItemLink(source, fileId) {
+  if (!source) {
+    return '<span class="meta-type">No IA source</span>';
+  }
+  const href = safeHttpUrl(source.item_url);
+  const identifier = source.identifier || "Internet Archive item";
+  const parentDetail = source.source_file_id && source.source_file_id !== fileId
+    ? `<span class="meta-type">via UFID ${escapeHtml(source.source_file_id)}</span>`
+    : "";
+  const fileDetail = source.file_name
+    ? `<span class="meta-type">${escapeHtml(source.file_name)}</span>`
+    : "";
+  if (!href) {
+    return `
+      <span>${escapeHtml(identifier)}</span>
+      ${parentDetail}
+      ${fileDetail}
+    `;
+  }
+  return `
+    <a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">
+      ${escapeHtml(identifier)}
+    </a>
+    ${parentDetail}
+    ${fileDetail}
+  `;
+}
+
 function renderAlertsMessage(message) {
   alertsTable.innerHTML = `<tr><td colspan="5">${escapeHtml(message)}</td></tr>`;
   renderAlertPagination();
 }
 
 function renderMatchesMessage(message) {
-  matchesTable.innerHTML = `<tr><td colspan="5">${escapeHtml(message)}</td></tr>`;
+  matchesTable.innerHTML = `<tr><td colspan="6">${escapeHtml(message)}</td></tr>`;
   renderMatchPagination();
+}
+
+function renderSourceFilters() {
+  if (!matchSourceFilters) {
+    return;
+  }
+  const authenticated = Boolean(state.user);
+  const disabled = !authenticated || state.loadingMatches || state.loadingSources;
+  if (!authenticated) {
+    matchSourceFilters.innerHTML = "";
+    return;
+  }
+
+  const allActive = state.selectedSourceKeys.length === 0;
+  const buttons = [
+    renderSourceFilterButton("", "All sources", allActive, disabled),
+    ...state.sourceOptions.map((source) => {
+      const key = source.source_key || "";
+      const active = state.selectedSourceKeys.includes(key);
+      return renderSourceFilterButton(key, sourceOptionLabel(source), active, disabled);
+    }),
+  ];
+  matchSourceFilters.innerHTML = buttons.join("");
+}
+
+function renderSourceFilterButton(key, label, active, disabled) {
+  return `
+    <button
+      class="source-filter-button${active ? " active" : ""}"
+      type="button"
+      data-source-key="${escapeHtml(key)}"
+      aria-pressed="${active ? "true" : "false"}"
+      ${disabled ? "disabled" : ""}
+    >${escapeHtml(label)}</button>
+  `;
+}
+
+function sourceOptionLabel(source) {
+  const count = Number(source.alert_count || 0);
+  const label = source.label || source.source_name || source.source_type || "Manual";
+  return count > 0 ? `${label} (${count})` : label;
+}
+
+function selectedSourceSummary() {
+  if (!state.selectedSourceKeys.length) {
+    return "";
+  }
+  const labels = new Map(
+    state.sourceOptions.map((source) => [
+      source.source_key,
+      source.label || source.source_name || source.source_type || source.source_key,
+    ]),
+  );
+  return state.selectedSourceKeys.map((key) => labels.get(key) || key).join(", ");
+}
+
+function startMatchesLoadingFeedback(requestId) {
+  stopMatchesLoadingFeedback();
+  renderMatchesLoadingMessage();
+  matchesLoadingTimer = window.setInterval(() => {
+    if (requestId !== state.matchesRequestId || !state.loadingMatches) {
+      stopMatchesLoadingFeedback();
+      return;
+    }
+    renderMatchesLoadingMessage();
+  }, 500);
+}
+
+function stopMatchesLoadingFeedback() {
+  if (matchesLoadingTimer !== null) {
+    window.clearInterval(matchesLoadingTimer);
+    matchesLoadingTimer = null;
+  }
+  state.matchesLoadingStartedAt = 0;
+}
+
+function renderMatchesLoadingMessage() {
+  const elapsedSeconds = state.matchesLoadingStartedAt
+    ? (performance.now() - state.matchesLoadingStartedAt) / 1000
+    : 0;
+  const elapsed = elapsedSeconds >= 1 ? ` (${elapsedSeconds.toFixed(1)}s)` : "";
+  renderMatchesMessage(`Finding matches${elapsed}.`);
+  const sourceSummary = selectedSourceSummary();
+  matchesSummary.textContent = sourceSummary
+    ? `Scanning ${sourceSummary} alert hashes against known files.`
+    : "Scanning alert hashes against known files.";
+  setGoldrushState(`Finding matches${elapsed}`, "quiet");
 }
 
 function renderSession() {
@@ -542,6 +734,7 @@ function renderSession() {
   }
   renderAlertPagination();
   renderMatchPagination();
+  renderSourceFilters();
 }
 
 function renderAlertPagination() {
@@ -742,4 +935,16 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function safeHttpUrl(value) {
+  if (!value) {
+    return "";
+  }
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+  } catch {
+    return "";
+  }
 }

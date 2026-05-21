@@ -154,7 +154,7 @@ Use a descriptive Internet Archive User-Agent:
 ufid ia-ingest `
   --backend https://ufid.example.com `
   --collection software `
-  --user-agent "UFID-IA-Ingest/0.6.0rc1 (gpt-5; contact: you@example.com)"
+  --user-agent "UFID-IA-Ingest/0.7.0 (gpt-5; contact: you@example.com)"
 ```
 
 Do not use browser-spoofed or stealth User-Agent strings. A clear tool name and

@@ -7,7 +7,7 @@ This repository currently contains runnable Python local applications that
 establish the core behavior and data model. The backend target is PostgreSQL,
 with SQLite available for local/offline use.
 
-Current release target: `0.6.0rc1`.
+Current release target: `0.7.0`.
 
 ## Components
 

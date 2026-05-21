@@ -238,13 +238,22 @@ set name as the alert name and the DAT header name as the alert description.
 
 ```http
 GET /api/v1/goldrush/alerts?limit=200&offset=0&q=<filter>
-GET /api/v1/goldrush/matches?limit=200&offset=0&q=<filter>
+GET /api/v1/goldrush/alert-sources
+GET /api/v1/goldrush/matches?limit=200&offset=0&q=<filter>&source_key=<source>
 Authorization: Bearer <token>
 ```
 
+The `alert-sources` endpoint returns source buckets for match filtering. Manual
+alerts use `source_key=manual`; imported alerts use a stable source key derived
+from their import type and source name. The matches endpoint accepts repeated
+`source_key` parameters to restrict results to one or more alert sources.
+
 The matches endpoint returns existing UFID records whose stored hashes match a
 Goldrush alert. If the alert has `size_bytes`, the UFID record must match that
-exact size as well.
+exact size as well. When UFID can trace the matched file to Internet Archive
+metadata, the match file includes an `internet_archive` object with the IA item
+URL. For archive members, that object points to the topmost archive parent that
+was ingested from IA.
 
 ## Add Or Enrich File Identity
 

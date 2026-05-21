@@ -14,15 +14,18 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ufid.database import (
     IdentityConflict,
+    SQLITE_BUSY_TIMEOUT_MS,
     authenticate_user,
     add_archive_member,
     add_file_metadata,
     connect,
+    create_goldrush_alert,
     create_session,
     create_user,
     find_file_by_hash,
     get_authenticated_user,
     list_files,
+    list_goldrush_matches,
     revoke_session,
     upsert_file_identity,
 )
@@ -108,6 +111,18 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("ufid_file_source", tables)
         self.assertNotIn("ufid_hash_algorithm", tables)
         self.assertNotIn("ufid_file_hash", tables)
+
+    def test_sqlite_connections_use_wal_and_busy_timeout(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"database-pragmas-{uuid.uuid4().hex}.sqlite"
+        with closing(connect(db_path)) as connection:
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+            synchronous = connection.execute("PRAGMA synchronous").fetchone()[0]
+
+        self.assertEqual(str(journal_mode).lower(), "wal")
+        self.assertGreaterEqual(int(busy_timeout), SQLITE_BUSY_TIMEOUT_MS)
+        self.assertEqual(int(synchronous), 1)
 
     def test_user_passwords_and_sessions_are_server_side(self) -> None:
         SCRATCH.mkdir(exist_ok=True)
@@ -460,6 +475,71 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(file_row_created)
         self.assertTrue(empty_row_created)
         self.assertEqual(len(parent_record["archive_members"]), 2)
+
+    def test_goldrush_matches_include_topmost_internet_archive_parent(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"database-goldrush-ia-parent-{uuid.uuid4().hex}.sqlite"
+        with closing(connect(db_path)) as connection:
+            parent = upsert_file_identity(
+                connection,
+                display_name="ia-archive.zip",
+                size_bytes=100,
+                hashes={"crc32": "11111111", "md5": "a" * 32, "sha1": "b" * 40},
+                metadata=[
+                    {
+                        "metadata_type": "text",
+                        "name": "ia_identifier",
+                        "value": "ia-top-item",
+                    },
+                    {
+                        "metadata_type": "url",
+                        "name": "ia_item_url",
+                        "value": "https://archive.org/details/ia-top-item",
+                    },
+                    {
+                        "metadata_type": "url",
+                        "name": "ia_file_url",
+                        "value": "https://archive.org/download/ia-top-item/ia-archive.zip",
+                    },
+                    {
+                        "metadata_type": "text",
+                        "name": "ia_file_name",
+                        "value": "ia-archive.zip",
+                    },
+                ],
+            )
+            child = upsert_file_identity(
+                connection,
+                display_name="inside.bin",
+                size_bytes=7,
+                hashes={"crc32": "22222222", "md5": "c" * 32, "sha1": "d" * 40},
+            )
+            add_archive_member(
+                connection,
+                parent_file_id=parent.file_id,
+                child_file_id=child.file_id,
+                archive_path="inside.bin",
+            )
+            create_goldrush_alert(
+                connection,
+                name="Watched child",
+                description="Should resolve IA parent",
+                hashes={"sha1": "d" * 40},
+            )
+
+            matches = list_goldrush_matches(connection)
+
+        self.assertEqual(len(matches), 1)
+        internet_archive = matches[0]["file"]["internet_archive"]
+        self.assertIsNotNone(internet_archive)
+        assert internet_archive is not None
+        self.assertEqual(internet_archive["source_file_id"], parent.file_id)
+        self.assertEqual(internet_archive["identifier"], "ia-top-item")
+        self.assertEqual(
+            internet_archive["item_url"],
+            "https://archive.org/details/ia-top-item",
+        )
+        self.assertEqual(internet_archive["file_name"], "ia-archive.zip")
 
 
 

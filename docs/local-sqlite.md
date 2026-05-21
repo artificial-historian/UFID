@@ -41,6 +41,12 @@ Browser and API access still require login. Direct CLI operations using `--db`
 do not require an API session because they access the local database file
 directly.
 
+The SQLite server uses one database connection per HTTP request. Connections are
+configured with WAL journaling and a 30-second busy timeout so reads can
+continue while a write is active and short write bursts wait for locks instead
+of failing immediately. If the database is still locked after that timeout, the
+API returns `503 Service Unavailable` with `Retry-After: 1`.
+
 ## Internet Archive Ingest
 
 Internet Archive ingest can also target SQLite directly. The IA state queue is a
@@ -96,7 +102,7 @@ Useful options:
 ```powershell
 .\scripts\start_windows_local_ia_discovery.ps1 -Collection software -MaxItems 1000
 .\scripts\start_windows_local_ia_discovery.ps1 -Query "collection:software AND format:ZIP" -MaxItems 500
-.\scripts\start_windows_local_ia_discovery.ps1 -UserAgent "UFID-IA-Ingest/0.6.0rc1 (contact: you@example.com)"
+.\scripts\start_windows_local_ia_discovery.ps1 -UserAgent "UFID-IA-Ingest/0.7.0 (contact: you@example.com)"
 .\scripts\start_windows_local_ia_discovery.ps1 -Port 8876 -PortScanCount 1
 .\scripts\start_windows_local_ia_discovery.ps1 -CreateAdmin -AdminUsername admin
 .\scripts\start_windows_local_ia_discovery.ps1 -Debug -MaxItems 100

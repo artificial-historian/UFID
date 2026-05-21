@@ -84,6 +84,11 @@ class UFIDPostgresRequestHandler(SimpleHTTPRequestHandler):
                 return
             self._handle_list_goldrush_alerts(parsed.query)
             return
+        if parsed.path == "/api/v1/goldrush/alert-sources":
+            if not self._require_role("reader"):
+                return
+            self._handle_list_goldrush_alert_sources()
+            return
         if parsed.path == "/api/v1/goldrush/matches":
             if not self._require_role("reader"):
                 return
@@ -339,6 +344,11 @@ class UFIDPostgresRequestHandler(SimpleHTTPRequestHandler):
             }
         )
 
+    def _handle_list_goldrush_alert_sources(self) -> None:
+        with database.connect(self.database_url) as connection:
+            sources = database.list_goldrush_alert_sources(connection)
+        self._write_json({"sources": sources, "count": len(sources)})
+
     def _handle_list_goldrush_matches(self, query: str) -> None:
         params = parse_qs(query)
         try:
@@ -349,14 +359,24 @@ class UFIDPostgresRequestHandler(SimpleHTTPRequestHandler):
             return
 
         search = _single_query_value(params, "q")
+        source_keys = tuple(
+            value.strip()
+            for value in params.get("source_key", [])
+            if value.strip()
+        )
         with database.connect(self.database_url) as connection:
             matches = database.list_goldrush_matches(
                 connection,
                 limit=limit,
                 offset=offset,
                 query=search,
+                source_keys=source_keys,
             )
-            total_count = database.count_goldrush_matches(connection, query=search)
+            total_count = database.count_goldrush_matches(
+                connection,
+                query=search,
+                source_keys=source_keys,
+            )
         self._write_json(
             {
                 "matches": matches,

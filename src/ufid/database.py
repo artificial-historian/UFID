@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 import sqlite3
+from threading import Lock
 from typing import Any, Iterable, Mapping, Sequence
 
 from ufid.auth import (
@@ -23,6 +24,8 @@ from ufid.auth import (
 
 
 LOGGER = logging.getLogger(__name__)
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+SQLITE_CONNECT_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_MS / 1000
 REQUIRED_HASH_ALGORITHMS = ("crc32", "md5", "sha1")
 OPTIONAL_HASH_ALGORITHMS = ("sha256", "blake3")
 SUPPORTED_HASH_ALGORITHMS = REQUIRED_HASH_ALGORITHMS + OPTIONAL_HASH_ALGORITHMS
@@ -71,6 +74,8 @@ ALLOWED_METADATA_TYPES = (
     "binary",
     "other",
 )
+_INITIALIZE_LOCK = Lock()
+_INITIALIZED_DATABASES: set[str] = set()
 
 
 SQLITE_SCHEMA = """
@@ -387,12 +392,29 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     if path.parent and str(path.parent) != ".":
         path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode = MEMORY")
-    connection.execute("PRAGMA foreign_keys = ON")
-    initialize(connection)
+    _configure_connection(connection)
+    _initialize_once(connection, path)
     return connection
+
+
+def _configure_connection(connection: sqlite3.Connection) -> None:
+    connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA synchronous = NORMAL")
+    connection.execute("PRAGMA foreign_keys = ON")
+
+
+def _initialize_once(connection: sqlite3.Connection, path: Path) -> None:
+    key = str(path.resolve())
+    if key in _INITIALIZED_DATABASES:
+        return
+    with _INITIALIZE_LOCK:
+        if key in _INITIALIZED_DATABASES:
+            return
+        initialize(connection)
+        _INITIALIZED_DATABASES.add(key)
 
 
 def initialize(connection: sqlite3.Connection) -> None:
@@ -1046,18 +1068,53 @@ def count_goldrush_alerts(
     return int(row["total"] if row is not None else 0)
 
 
+def list_goldrush_alert_sources(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        f"""
+        WITH goldrush_alert_source AS (
+            SELECT
+                {_goldrush_alert_source_key_sql()} AS source_key,
+                CASE
+                    WHEN COALESCE(a.source_type, '') = ''
+                     AND COALESCE(a.source_name, '') = ''
+                    THEN 'Manual'
+                    ELSE COALESCE(NULLIF(a.source_name, ''), NULLIF(a.source_type, ''), 'Imported')
+                END AS label,
+                NULLIF(a.source_type, '') AS source_type,
+                NULLIF(a.source_name, '') AS source_name
+            FROM ufid_goldrush_alert a
+        )
+        SELECT
+            source_key,
+            label,
+            source_type,
+            source_name,
+            COUNT(*) AS alert_count
+        FROM goldrush_alert_source
+        GROUP BY source_key, label, source_type, source_name
+        ORDER BY
+            CASE WHEN source_key = 'manual' THEN 0 ELSE 1 END,
+            lower(label),
+            source_key
+        """
+    ).fetchall()
+    return [_goldrush_alert_source_row(row) for row in rows]
+
+
 def list_goldrush_matches(
     connection: sqlite3.Connection,
     *,
     limit: int = 200,
     offset: int = 0,
     query: str | None = None,
+    source_keys: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     bounded_limit = min(max(limit, 1), 200)
     bounded_offset = max(offset, 0)
-    filter_sql, params = _goldrush_match_filter(query)
+    filter_sql, params = _goldrush_match_filter(query, source_keys=source_keys)
     rows = connection.execute(
         f"""
+        {_goldrush_match_cte_sql(include_sources=True)}
         SELECT
             a.id AS alert_id,
             a.name AS alert_name,
@@ -1095,13 +1152,18 @@ def list_goldrush_matches(
                 ORDER BY fm.added_at, fm.id
                 LIMIT 1
             ) AS file_content_type,
-            CASE WHEN a.crc32 IS NOT NULL AND a.crc32 = f.crc32 THEN 1 ELSE 0 END AS matched_crc32,
-            CASE WHEN a.md5 IS NOT NULL AND a.md5 = f.md5 THEN 1 ELSE 0 END AS matched_md5,
-            CASE WHEN a.sha1 IS NOT NULL AND a.sha1 = f.sha1 THEN 1 ELSE 0 END AS matched_sha1,
-            CASE WHEN a.sha256 IS NOT NULL AND a.sha256 = f.sha256 THEN 1 ELSE 0 END AS matched_sha256,
-            CASE WHEN a.blake3 IS NOT NULL AND a.blake3 = f.blake3 THEN 1 ELSE 0 END AS matched_blake3,
-            CASE WHEN a.size_bytes IS NOT NULL AND a.size_bytes = f.size_bytes THEN 1 ELSE 0 END AS size_matched
-        {_goldrush_match_from_sql()}
+            m.matched_crc32,
+            m.matched_md5,
+            m.matched_sha1,
+            m.matched_sha256,
+            m.matched_blake3,
+            CASE WHEN a.size_bytes IS NOT NULL THEN 1 ELSE 0 END AS size_matched,
+            s.source_file_id,
+            s.ia_identifier,
+            s.ia_item_url,
+            s.ia_file_url,
+            s.ia_file_name
+        {_goldrush_match_from_sql(include_sources=True)}
         {filter_sql}
         ORDER BY a.id DESC, f.id DESC
         LIMIT ? OFFSET ?
@@ -1115,10 +1177,12 @@ def count_goldrush_matches(
     connection: sqlite3.Connection,
     *,
     query: str | None = None,
+    source_keys: Sequence[str] | None = None,
 ) -> int:
-    filter_sql, params = _goldrush_match_filter(query)
+    filter_sql, params = _goldrush_match_filter(query, source_keys=source_keys)
     row = connection.execute(
         f"""
+        {_goldrush_match_cte_sql()}
         SELECT COUNT(*) AS total
         {_goldrush_match_from_sql()}
         {filter_sql}
@@ -1584,6 +1648,17 @@ def _goldrush_alert_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _goldrush_alert_source_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    values = dict(row)
+    return {
+        "source_key": values["source_key"],
+        "label": values["label"],
+        "source_type": values["source_type"],
+        "source_name": values["source_name"],
+        "alert_count": int(values["alert_count"]),
+    }
+
+
 def _goldrush_match_row(row: Mapping[str, Any]) -> dict[str, Any]:
     values = dict(row)
     alert_hashes = {
@@ -1594,6 +1669,7 @@ def _goldrush_match_row(row: Mapping[str, Any]) -> dict[str, Any]:
         algorithm: values.get(f"file_{algorithm}")
         for algorithm in SUPPORTED_HASH_ALGORITHMS
     }
+    internet_archive = _goldrush_match_internet_archive(values)
     matched_algorithms = [
         algorithm
         for algorithm in SUPPORTED_HASH_ALGORITHMS
@@ -1617,9 +1693,26 @@ def _goldrush_match_row(row: Mapping[str, Any]) -> dict[str, Any]:
             "display_name": values["file_display_name"] or None,
             "content_type": values["file_content_type"],
             "hashes": file_hashes,
+            "internet_archive": internet_archive,
         },
         "matched_algorithms": matched_algorithms,
         "size_matched": bool(values["size_matched"]),
+    }
+
+
+def _goldrush_match_internet_archive(values: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not values.get("ia_identifier") and not values.get("ia_item_url"):
+        return None
+    identifier = values.get("ia_identifier")
+    item_url = values.get("ia_item_url")
+    if not item_url and identifier:
+        item_url = f"https://archive.org/details/{identifier}"
+    return {
+        "source_file_id": values.get("source_file_id"),
+        "identifier": identifier,
+        "item_url": item_url,
+        "file_url": values.get("ia_file_url"),
+        "file_name": values.get("ia_file_name"),
     }
 
 
@@ -1646,28 +1739,174 @@ def _goldrush_alert_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
     )
 
 
-def _goldrush_match_from_sql() -> str:
-    return """
-        FROM ufid_goldrush_alert a
-        JOIN ufid_file f
-          ON (
-              (a.crc32 IS NOT NULL AND a.crc32 = f.crc32)
-           OR (a.md5 IS NOT NULL AND a.md5 = f.md5)
-           OR (a.sha1 IS NOT NULL AND a.sha1 = f.sha1)
-           OR (a.sha256 IS NOT NULL AND a.sha256 = f.sha256)
-           OR (a.blake3 IS NOT NULL AND a.blake3 = f.blake3)
-          )
-        WHERE (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
+def _goldrush_match_cte_sql(*, include_sources: bool = False) -> str:
+    source_ctes = (
+        """
+        ,
+        goldrush_match_ancestor(file_id, ancestor_file_id, depth) AS (
+            SELECT file_id, file_id, 0
+            FROM goldrush_match
+
+            UNION ALL
+
+            SELECT
+                gma.file_id,
+                am.parent_file_id,
+                gma.depth + 1
+            FROM goldrush_match_ancestor gma
+            JOIN ufid_archive_member am
+              ON am.child_file_id = gma.ancestor_file_id
+            WHERE gma.depth < 128
+        ),
+        goldrush_match_ia_candidate AS (
+            SELECT *
+            FROM (
+                SELECT
+                    gma.file_id,
+                    gma.ancestor_file_id AS source_file_id,
+                    gma.depth,
+                    (
+                        SELECT fm.value
+                        FROM ufid_file_meta fm
+                        WHERE fm.file_id = gma.ancestor_file_id
+                          AND fm.name = 'ia_identifier'
+                        ORDER BY fm.added_at, fm.id
+                        LIMIT 1
+                    ) AS ia_identifier,
+                    (
+                        SELECT fm.value
+                        FROM ufid_file_meta fm
+                        WHERE fm.file_id = gma.ancestor_file_id
+                          AND fm.name = 'ia_item_url'
+                        ORDER BY fm.added_at, fm.id
+                        LIMIT 1
+                    ) AS ia_item_url,
+                    (
+                        SELECT fm.value
+                        FROM ufid_file_meta fm
+                        WHERE fm.file_id = gma.ancestor_file_id
+                          AND fm.name = 'ia_file_url'
+                        ORDER BY fm.added_at, fm.id
+                        LIMIT 1
+                    ) AS ia_file_url,
+                    (
+                        SELECT fm.value
+                        FROM ufid_file_meta fm
+                        WHERE fm.file_id = gma.ancestor_file_id
+                          AND fm.name = 'ia_file_name'
+                        ORDER BY fm.added_at, fm.id
+                        LIMIT 1
+                    ) AS ia_file_name
+                FROM goldrush_match_ancestor gma
+            ) c
+            WHERE c.ia_identifier IS NOT NULL
+               OR c.ia_item_url IS NOT NULL
+        ),
+        goldrush_match_ia_source AS (
+            SELECT
+                source_file_id,
+                file_id,
+                ia_identifier,
+                ia_item_url,
+                ia_file_url,
+                ia_file_name
+            FROM (
+                SELECT
+                    c.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.file_id
+                        ORDER BY c.depth DESC, c.source_file_id ASC
+                    ) AS source_rank
+                FROM goldrush_match_ia_candidate c
+            ) ranked
+            WHERE source_rank = 1
+        )
+        """
+        if include_sources
+        else ""
+    )
+    return f"""
+        WITH RECURSIVE goldrush_match_pair AS (
+            SELECT a.id AS alert_id, f.id AS file_id, 'crc32' AS algorithm
+            FROM ufid_goldrush_alert a
+            JOIN ufid_file f ON f.crc32 = a.crc32
+            WHERE a.crc32 IS NOT NULL
+              AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
+
+            UNION ALL
+
+            SELECT a.id AS alert_id, f.id AS file_id, 'md5' AS algorithm
+            FROM ufid_goldrush_alert a
+            JOIN ufid_file f ON f.md5 = a.md5
+            WHERE a.md5 IS NOT NULL
+              AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
+
+            UNION ALL
+
+            SELECT a.id AS alert_id, f.id AS file_id, 'sha1' AS algorithm
+            FROM ufid_goldrush_alert a
+            JOIN ufid_file f ON f.sha1 = a.sha1
+            WHERE a.sha1 IS NOT NULL
+              AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
+
+            UNION ALL
+
+            SELECT a.id AS alert_id, f.id AS file_id, 'sha256' AS algorithm
+            FROM ufid_goldrush_alert a
+            JOIN ufid_file f ON f.sha256 = a.sha256
+            WHERE a.sha256 IS NOT NULL
+              AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
+
+            UNION ALL
+
+            SELECT a.id AS alert_id, f.id AS file_id, 'blake3' AS algorithm
+            FROM ufid_goldrush_alert a
+            JOIN ufid_file f ON f.blake3 = a.blake3
+            WHERE a.blake3 IS NOT NULL
+              AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
+        ),
+        goldrush_match AS (
+            SELECT
+                alert_id,
+                file_id,
+                MAX(CASE WHEN algorithm = 'crc32' THEN 1 ELSE 0 END) AS matched_crc32,
+                MAX(CASE WHEN algorithm = 'md5' THEN 1 ELSE 0 END) AS matched_md5,
+                MAX(CASE WHEN algorithm = 'sha1' THEN 1 ELSE 0 END) AS matched_sha1,
+                MAX(CASE WHEN algorithm = 'sha256' THEN 1 ELSE 0 END) AS matched_sha256,
+                MAX(CASE WHEN algorithm = 'blake3' THEN 1 ELSE 0 END) AS matched_blake3
+            FROM goldrush_match_pair
+            GROUP BY alert_id, file_id
+        )
+        {source_ctes}
     """
 
 
-def _goldrush_match_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
-    if not query:
-        return "", ()
-    like = f"%{query}%"
-    return (
-        """
-          AND (
+def _goldrush_match_from_sql(*, include_sources: bool = False) -> str:
+    source_join = (
+        "LEFT JOIN goldrush_match_ia_source s ON s.file_id = f.id"
+        if include_sources
+        else ""
+    )
+    return f"""
+        FROM goldrush_match m
+        JOIN ufid_goldrush_alert a ON a.id = m.alert_id
+        JOIN ufid_file f ON f.id = m.file_id
+        {source_join}
+        WHERE 1 = 1
+    """
+
+
+def _goldrush_match_filter(
+    query: str | None,
+    *,
+    source_keys: Sequence[str] | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    clauses: list[str] = []
+    params: list[str] = []
+    if query:
+        like = f"%{query}%"
+        clauses.append(
+            """
               CAST(a.id AS TEXT) LIKE ?
            OR CAST(f.id AS TEXT) LIKE ?
            OR CAST(a.size_bytes AS TEXT) LIKE ?
@@ -1697,33 +1936,42 @@ def _goldrush_match_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
                     OR fm.notes LIKE ?
                   )
            )
-          )
-        """,
-        (
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-        ),
-    )
+            """
+        )
+        params.extend([like] * 22)
+
+    normalized_source_keys = _normalize_goldrush_source_keys(source_keys)
+    if normalized_source_keys:
+        placeholders = ", ".join("?" for _ in normalized_source_keys)
+        clauses.append(f"{_goldrush_alert_source_key_sql()} IN ({placeholders})")
+        params.extend(normalized_source_keys)
+
+    if not clauses:
+        return "", ()
+    sql = "\n".join(f"          AND ({clause}\n          )" for clause in clauses)
+    return sql, tuple(params)
+
+
+def _goldrush_alert_source_key_sql() -> str:
+    return """
+        CASE
+            WHEN COALESCE(a.source_type, '') = ''
+             AND COALESCE(a.source_name, '') = ''
+            THEN 'manual'
+            ELSE COALESCE(a.source_type, '') || '|' || COALESCE(a.source_name, '')
+        END
+    """
+
+
+def _normalize_goldrush_source_keys(
+    source_keys: Sequence[str] | None,
+) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in source_keys or ():
+        text = str(value).strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return tuple(normalized)
 
 
 def _required_text(value: Any, name: str) -> str:

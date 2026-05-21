@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: UFID API
-  version: 0.6.0rc1
+  version: 0.7.0
 servers:
   - url: https://ufid.example.com
 paths:
@@ -254,6 +254,27 @@ paths:
                 $ref: "#/components/schemas/GoldrushImportResult"
         "400":
           $ref: "#/components/responses/Error"
+  /api/v1/goldrush/alert-sources:
+    get:
+      summary: List Goldrush alert sources for match filtering
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Goldrush alert source list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources, count]
+                properties:
+                  sources:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GoldrushAlertSource"
+                  count:
+                    type: integer
   /api/v1/goldrush/matches:
     get:
       summary: List current UFID records matching Goldrush alerts
@@ -265,6 +286,15 @@ paths:
           in: query
           schema:
             type: string
+        - name: source_key
+          in: query
+          description: Repeat to restrict matches to one or more alert sources.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
         - name: limit
           in: query
           schema:
@@ -654,6 +684,25 @@ components:
           $ref: "#/components/schemas/GoldrushAlert"
         created:
           type: boolean
+    GoldrushAlertSource:
+      type: object
+      required: [source_key, label, alert_count]
+      properties:
+        source_key:
+          type: string
+          description: Use `manual` for manual alerts; imported sources use `source_type|source_name`.
+        label:
+          type: string
+        source_type:
+          type:
+            - string
+            - "null"
+        source_name:
+          type:
+            - string
+            - "null"
+        alert_count:
+          type: integer
     GoldrushImportRequest:
       type: object
       required: [text]
@@ -715,6 +764,31 @@ components:
                 - "null"
             hashes:
               $ref: "#/components/schemas/HashSet"
+            internet_archive:
+              type:
+                - object
+                - "null"
+              properties:
+                source_file_id:
+                  type:
+                    - integer
+                    - "null"
+                identifier:
+                  type:
+                    - string
+                    - "null"
+                item_url:
+                  type:
+                    - string
+                    - "null"
+                file_url:
+                  type:
+                    - string
+                    - "null"
+                file_name:
+                  type:
+                    - string
+                    - "null"
         matched_algorithms:
           type: array
           items:

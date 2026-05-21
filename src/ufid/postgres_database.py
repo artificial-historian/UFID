@@ -15,10 +15,14 @@ from ufid.database import (
     UpsertResult,
     _derived_metadata_fields,
     _goldrush_alert_row,
+    _goldrush_alert_source_key_sql,
+    _goldrush_alert_source_row,
+    _goldrush_match_cte_sql,
     _goldrush_match_row,
     _hash_column,
     _metadata_entries,
     _normalize_goldrush_alert,
+    _normalize_goldrush_source_keys,
     _normalize_roles,
     _normalize_username,
     _validate_required_identity,
@@ -713,19 +717,55 @@ def count_goldrush_alerts(
     return int(row["total"] if row is not None else 0)
 
 
+def list_goldrush_alert_sources(connection) -> list[dict[str, Any]]:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            WITH goldrush_alert_source AS (
+                SELECT
+                    {_goldrush_alert_source_key_sql()} AS source_key,
+                    CASE
+                        WHEN COALESCE(a.source_type, '') = ''
+                         AND COALESCE(a.source_name, '') = ''
+                        THEN 'Manual'
+                        ELSE COALESCE(NULLIF(a.source_name, ''), NULLIF(a.source_type, ''), 'Imported')
+                    END AS label,
+                    NULLIF(a.source_type, '') AS source_type,
+                    NULLIF(a.source_name, '') AS source_name
+                FROM ufid_goldrush_alert a
+            )
+            SELECT
+                source_key,
+                label,
+                source_type,
+                source_name,
+                COUNT(*) AS alert_count
+            FROM goldrush_alert_source
+            GROUP BY source_key, label, source_type, source_name
+            ORDER BY
+                CASE WHEN source_key = 'manual' THEN 0 ELSE 1 END,
+                lower(label),
+                source_key
+            """
+        )
+        return [_goldrush_alert_source_row(row) for row in cursor.fetchall()]
+
+
 def list_goldrush_matches(
     connection,
     *,
     limit: int = 200,
     offset: int = 0,
     query: str | None = None,
+    source_keys: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     bounded_limit = min(max(limit, 1), 200)
     bounded_offset = max(offset, 0)
-    filter_sql, params = _goldrush_match_filter(query)
+    filter_sql, params = _goldrush_match_filter(query, source_keys=source_keys)
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
+            {_goldrush_match_cte_sql(include_sources=True)}
             SELECT
                 a.id AS alert_id,
                 a.name AS alert_name,
@@ -763,13 +803,18 @@ def list_goldrush_matches(
                     ORDER BY fm.added_at, fm.id
                     LIMIT 1
                 ) AS file_content_type,
-                (a.crc32 IS NOT NULL AND a.crc32 = f.crc32) AS matched_crc32,
-                (a.md5 IS NOT NULL AND a.md5 = f.md5) AS matched_md5,
-                (a.sha1 IS NOT NULL AND a.sha1 = f.sha1) AS matched_sha1,
-                (a.sha256 IS NOT NULL AND a.sha256 = f.sha256) AS matched_sha256,
-                (a.blake3 IS NOT NULL AND a.blake3 = f.blake3) AS matched_blake3,
-                (a.size_bytes IS NOT NULL AND a.size_bytes = f.size_bytes) AS size_matched
-            {_goldrush_match_from_sql()}
+                m.matched_crc32,
+                m.matched_md5,
+                m.matched_sha1,
+                m.matched_sha256,
+                m.matched_blake3,
+                (a.size_bytes IS NOT NULL) AS size_matched,
+                s.source_file_id,
+                s.ia_identifier,
+                s.ia_item_url,
+                s.ia_file_url,
+                s.ia_file_name
+            {_goldrush_match_from_sql(include_sources=True)}
             {filter_sql}
             ORDER BY a.id DESC, f.id DESC
             LIMIT %s OFFSET %s
@@ -783,11 +828,13 @@ def count_goldrush_matches(
     connection,
     *,
     query: str | None = None,
+    source_keys: Sequence[str] | None = None,
 ) -> int:
-    filter_sql, params = _goldrush_match_filter(query)
+    filter_sql, params = _goldrush_match_filter(query, source_keys=source_keys)
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
+            {_goldrush_match_cte_sql()}
             SELECT COUNT(*) AS total
             {_goldrush_match_from_sql()}
             {filter_sql}
@@ -1135,28 +1182,32 @@ def _goldrush_alert_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
     )
 
 
-def _goldrush_match_from_sql() -> str:
-    return """
-        FROM ufid_goldrush_alert a
-        JOIN ufid_file f
-          ON (
-              (a.crc32 IS NOT NULL AND a.crc32 = f.crc32)
-           OR (a.md5 IS NOT NULL AND a.md5 = f.md5)
-           OR (a.sha1 IS NOT NULL AND a.sha1 = f.sha1)
-           OR (a.sha256 IS NOT NULL AND a.sha256 = f.sha256)
-           OR (a.blake3 IS NOT NULL AND a.blake3 = f.blake3)
-          )
-        WHERE (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
+def _goldrush_match_from_sql(*, include_sources: bool = False) -> str:
+    source_join = (
+        "LEFT JOIN goldrush_match_ia_source s ON s.file_id = f.id"
+        if include_sources
+        else ""
+    )
+    return f"""
+        FROM goldrush_match m
+        JOIN ufid_goldrush_alert a ON a.id = m.alert_id
+        JOIN ufid_file f ON f.id = m.file_id
+        {source_join}
+        WHERE 1 = 1
     """
 
 
-def _goldrush_match_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
-    if not query:
-        return "", ()
-    like = f"%{query}%"
-    return (
-        """
-          AND (
+def _goldrush_match_filter(
+    query: str | None,
+    *,
+    source_keys: Sequence[str] | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    clauses: list[str] = []
+    params: list[str] = []
+    if query:
+        like = f"%{query}%"
+        clauses.append(
+            """
               CAST(a.id AS TEXT) ILIKE %s
            OR CAST(f.id AS TEXT) ILIKE %s
            OR CAST(a.size_bytes AS TEXT) ILIKE %s
@@ -1186,33 +1237,20 @@ def _goldrush_match_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
                     OR fm.notes ILIKE %s
                   )
            )
-          )
-        """,
-        (
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-            like,
-        ),
-    )
+            """
+        )
+        params.extend([like] * 22)
+
+    normalized_source_keys = _normalize_goldrush_source_keys(source_keys)
+    if normalized_source_keys:
+        placeholders = ", ".join("%s" for _ in normalized_source_keys)
+        clauses.append(f"{_goldrush_alert_source_key_sql()} IN ({placeholders})")
+        params.extend(normalized_source_keys)
+
+    if not clauses:
+        return "", ()
+    sql = "\n".join(f"          AND ({clause}\n          )" for clause in clauses)
+    return sql, tuple(params)
 
 
 def _set_user_roles(

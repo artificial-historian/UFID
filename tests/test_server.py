@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import threading
 import unittest
+from urllib.parse import urlencode
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import uuid
@@ -17,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".vendor"))
 sys.path.insert(0, str(ROOT / "src"))
 
-from ufid.server import UFIDRequestHandler, _coerce_metadata_payload
+from ufid.server import UFIDRequestHandler, _coerce_metadata_payload, _is_sqlite_busy_error
 from ufid.database import connect, create_user
 from ufid.goldrush import parse_logiqx_dat
 from ufid import add, lookup
@@ -198,6 +201,57 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 400)
         raised.exception.close()
 
+    def test_sqlite_server_handles_parallel_file_writes(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"server-parallel-{uuid.uuid4().hex}.sqlite"
+        self._create_test_user(db_path)
+        handler_class = type(
+            "TestUFIDParallelRequestHandler",
+            (UFIDRequestHandler,),
+            {"db_path": db_path, "web_root": ROOT / "web"},
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+        try:
+            token = self._login(base_url)
+
+            def post_file(index: int) -> dict:
+                return self._post_json(
+                    f"{base_url}/api/v1/files",
+                    {
+                        "display_name": f"parallel-{index}.bin",
+                        "size_bytes": 1000 + index,
+                        "hashes": {
+                            "crc32": f"{index:08x}",
+                            "md5": f"{index:032x}",
+                            "sha1": f"{index:040x}",
+                        },
+                    },
+                    token=token,
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                created = list(executor.map(post_file, range(1, 17)))
+            listed = self._get_json(
+                f"{base_url}/api/v1/files?q=parallel&limit=20",
+                token=token,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertTrue(all(item["created"] for item in created))
+        self.assertEqual(listed["total_count"], 16)
+
+    def test_sqlite_busy_errors_are_retryable(self) -> None:
+        self.assertTrue(_is_sqlite_busy_error(sqlite3.OperationalError("database is locked")))
+        self.assertTrue(_is_sqlite_busy_error(sqlite3.OperationalError("database table is locked")))
+        self.assertFalse(_is_sqlite_busy_error(sqlite3.OperationalError("syntax error")))
+
     def test_goldrush_alerts_dat_import_and_matches(self) -> None:
         SCRATCH.mkdir(exist_ok=True)
         db_path = SCRATCH / f"server-goldrush-{uuid.uuid4().hex}.sqlite"
@@ -267,6 +321,20 @@ class ServerTests(unittest.TestCase):
                 f"{base_url}/api/v1/goldrush/matches?q=Goldrush%20Set",
                 token=token,
             )
+            sources = self._get_json(
+                f"{base_url}/api/v1/goldrush/alert-sources",
+                token=token,
+            )
+            source_keys = {source["source_key"] for source in sources["sources"]}
+            dat_source_key = "logiqx-dat-xml|Goldrush Test DAT"
+            manual_source_matches = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches?source_key=manual",
+                token=token,
+            )
+            dat_source_matches = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches?{urlencode({'source_key': dat_source_key})}",
+                token=token,
+            )
             with self.assertRaises(HTTPError) as raised:
                 self._post_json(
                     f"{base_url}/api/v1/goldrush/alerts",
@@ -300,6 +368,18 @@ class ServerTests(unittest.TestCase):
             ["crc32", "md5", "sha1"],
         )
         self.assertTrue(dat_matches["matches"][0]["size_matched"])
+        self.assertEqual(sources["count"], 2)
+        self.assertEqual(source_keys, {"manual", "logiqx-dat-xml|Goldrush Test DAT"})
+        self.assertEqual(manual_source_matches["total_count"], 1)
+        self.assertEqual(
+            manual_source_matches["matches"][0]["alert"]["name"],
+            "Manual target",
+        )
+        self.assertEqual(dat_source_matches["total_count"], 1)
+        self.assertEqual(
+            dat_source_matches["matches"][0]["alert"]["name"],
+            "Goldrush Set",
+        )
         self.assertEqual(raised.exception.code, 400)
         raised.exception.close()
 
