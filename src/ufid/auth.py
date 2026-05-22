@@ -14,6 +14,7 @@ PASSWORD_HASH_ITERATIONS = 600_000
 SESSION_TOKEN_BYTES = 32
 SESSION_TOKEN_HASH_ALGORITHM = "sha256"
 DEFAULT_SESSION_SECONDS = 60 * 60 * 24 * 30
+DEFAULT_REGISTRATION_TOKEN_SECONDS = 60 * 60 * 24 * 7
 SESSION_COOKIE_NAME = "ufid_session"
 MIN_PASSWORD_LENGTH = 12
 
@@ -26,6 +27,10 @@ class AuthenticatedUser:
     roles: tuple[str, ...]
     session_id: int | None = None
     expires_at: str | None = None
+    created_at: str | None = None
+    activated_at: str | None = None
+    registration_completed_at: str | None = None
+    disabled_at: str | None = None
 
     def to_public_dict(self) -> dict[str, object]:
         return {
@@ -35,6 +40,10 @@ class AuthenticatedUser:
             "roles": list(self.roles),
             "session_id": self.session_id,
             "expires_at": self.expires_at,
+            "created_at": self.created_at,
+            "activated_at": self.activated_at,
+            "registration_completed_at": self.registration_completed_at,
+            "disabled_at": self.disabled_at,
         }
 
 

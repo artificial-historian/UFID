@@ -6,7 +6,7 @@ import gzip
 import json
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import time
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
@@ -494,14 +494,26 @@ def safe_download_path(root: Path, identifier: str, filename: str) -> Path:
     return candidate
 
 
+IA_ARTIFACT_SUFFIXES = (
+    "_files.xml",
+    "_meta.sqlite",
+    "_meta.xml",
+    "_reviews.xml",
+    "_itemimage.jpg",
+)
+IA_ARTIFACT_BASENAMES = {
+    "files.xml",
+    "meta.sqlite",
+    "meta.xml",
+}
+
+
 def is_metadata_file(ia_file: IAFile) -> bool:
-    name = ia_file.name.lower()
+    name = PurePosixPath(ia_file.name).name.lower()
     return (
         ia_file.format == "Metadata"
-        or name.endswith("_meta.xml")
-        or name.endswith("_files.xml")
-        or name.endswith("_reviews.xml")
-        or name.endswith("_itemimage.jpg")
+        or name in IA_ARTIFACT_BASENAMES
+        or name.endswith(IA_ARTIFACT_SUFFIXES)
     )
 
 

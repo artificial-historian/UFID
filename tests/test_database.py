@@ -18,15 +18,30 @@ from ufid.database import (
     authenticate_user,
     add_archive_member,
     add_file_metadata,
+    approve_user_removal_request,
+    block_user_removal_request,
+    change_user_password,
+    clear_goldrush_alerts,
+    complete_registration,
     connect,
+    count_goldrush_alerts,
     create_goldrush_alert,
+    create_invited_user,
     create_session,
     create_user,
     find_file_by_hash,
     get_authenticated_user,
+    get_registration_token,
+    get_user_by_id,
+    list_user_removal_requests,
     list_files,
     list_goldrush_matches,
+    register_user,
+    request_user_removal,
     revoke_session,
+    scan_goldrush_matches,
+    set_user_activation,
+    update_user_roles,
     upsert_file_identity,
 )
 from ufid.auth import verify_password
@@ -109,6 +124,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("idx_ufid_identity_conflict_unique", conflict_indexes)
         self.assertIn("ufid_source", tables)
         self.assertIn("ufid_file_source", tables)
+        self.assertIn("ufid_goldrush_user_alert", tables)
+        self.assertIn("ufid_goldrush_user_match", tables)
         self.assertNotIn("ufid_hash_algorithm", tables)
         self.assertNotIn("ufid_file_hash", tables)
 
@@ -180,6 +197,156 @@ class DatabaseTests(unittest.TestCase):
                 )
 
         self.assertEqual(created["username"], "alice")
+
+    def test_registration_activation_invites_and_password_changes(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"database-user-lifecycle-{uuid.uuid4().hex}.sqlite"
+        with closing(connect(db_path)) as connection:
+            registered = register_user(
+                connection,
+                username="Bob",
+                password="correct horse battery staple",
+                display_name="Bob",
+            )
+            self.assertEqual(registered["username"], "bob")
+            self.assertEqual(registered["status"], "pending_activation")
+            self.assertIsNone(
+                authenticate_user(
+                    connection,
+                    username="bob",
+                    password="correct horse battery staple",
+                )
+            )
+
+            activated = set_user_activation(
+                connection,
+                user_id=int(registered["id"]),
+                active=True,
+            )
+            assert activated is not None
+            authenticated = authenticate_user(
+                connection,
+                username="bob",
+                password="correct horse battery staple",
+            )
+            assert authenticated is not None
+            first_token, _ = create_session(connection, user_id=int(authenticated["id"]))
+            second_token, _ = create_session(connection, user_id=int(authenticated["id"]))
+            self.assertFalse(
+                change_user_password(
+                    connection,
+                    user_id=int(authenticated["id"]),
+                    current_password="wrong password",
+                    new_password="new correct horse password",
+                    keep_token=first_token,
+                )
+            )
+            self.assertTrue(
+                change_user_password(
+                    connection,
+                    user_id=int(authenticated["id"]),
+                    current_password="correct horse battery staple",
+                    new_password="new correct horse password",
+                    keep_token=first_token,
+                )
+            )
+            self.assertIsNotNone(get_authenticated_user(connection, first_token))
+            self.assertIsNone(get_authenticated_user(connection, second_token))
+            self.assertIsNone(
+                authenticate_user(
+                    connection,
+                    username="bob",
+                    password="correct horse battery staple",
+                )
+            )
+            self.assertIsNotNone(
+                authenticate_user(
+                    connection,
+                    username="bob",
+                    password="new correct horse password",
+                )
+            )
+
+            invited, registration_token, registration = create_invited_user(
+                connection,
+                username="carol",
+                display_name="Carol",
+                roles=["reader", "contributor"],
+                created_by_user_id=int(registered["id"]),
+            )
+            self.assertEqual(invited["status"], "invited")
+            self.assertEqual(registration["user_id"], invited["id"])
+            self.assertIsNotNone(get_registration_token(connection, registration_token))
+            completed = complete_registration(
+                connection,
+                token=registration_token,
+                password="carol correct horse password",
+            )
+            assert completed is not None
+            self.assertEqual(completed["status"], "active")
+            self.assertIsNone(get_registration_token(connection, registration_token))
+            self.assertIsNotNone(
+                authenticate_user(
+                    connection,
+                    username="carol",
+                    password="carol correct horse password",
+                )
+            )
+            rerolled = update_user_roles(
+                connection,
+                user_id=int(completed["id"]),
+                roles=["curator", "reader"],
+            )
+            assert rerolled is not None
+            self.assertEqual(rerolled["roles"], ["curator", "reader"])
+            with self.assertRaises(ValueError):
+                update_user_roles(
+                    connection,
+                    user_id=int(completed["id"]),
+                    roles=[],
+                )
+
+    def test_user_removal_requests_can_be_blocked_or_approved(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"database-user-removal-{uuid.uuid4().hex}.sqlite"
+        with closing(connect(db_path)) as connection:
+            admin = create_user(
+                connection,
+                username="admin",
+                password="correct horse battery staple",
+                roles=["admin"],
+            )
+            user = create_user(
+                connection,
+                username="delete-me",
+                password="correct horse battery staple",
+                roles=["reader"],
+            )
+            request = request_user_removal(connection, user_id=int(user["id"]))
+            duplicate = request_user_removal(connection, user_id=int(user["id"]))
+            pending = list_user_removal_requests(connection, status="pending")
+            blocked = block_user_removal_request(
+                connection,
+                request_id=int(request["id"]),
+                decided_by_user_id=int(admin["id"]),
+                notes="Keep audit account",
+            )
+            second_request = request_user_removal(connection, user_id=int(user["id"]))
+            approved = approve_user_removal_request(
+                connection,
+                request_id=int(second_request["id"]),
+                decided_by_user_id=int(admin["id"]),
+            )
+
+        self.assertEqual(request["id"], duplicate["id"])
+        self.assertEqual(len(pending), 1)
+        assert blocked is not None
+        self.assertEqual(blocked["status"], "blocked")
+        assert approved is not None
+        self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["deleted_user_id"], user["id"])
+        with closing(connect(db_path)) as connection:
+            self.assertIsNone(get_user_by_id(connection, int(user["id"])))
 
     def test_upsert_creates_then_enriches_existing_identity(self) -> None:
         SCRATCH.mkdir(exist_ok=True)
@@ -480,6 +647,18 @@ class DatabaseTests(unittest.TestCase):
         SCRATCH.mkdir(exist_ok=True)
         db_path = SCRATCH / f"database-goldrush-ia-parent-{uuid.uuid4().hex}.sqlite"
         with closing(connect(db_path)) as connection:
+            user = create_user(
+                connection,
+                username="goldrush-user",
+                password="correct horse battery staple",
+                roles=["reader", "contributor"],
+            )
+            other_user = create_user(
+                connection,
+                username="goldrush-other",
+                password="correct horse battery staple",
+                roles=["reader", "contributor"],
+            )
             parent = upsert_file_identity(
                 connection,
                 display_name="ia-archive.zip",
@@ -522,14 +701,32 @@ class DatabaseTests(unittest.TestCase):
             )
             create_goldrush_alert(
                 connection,
+                user_id=int(user["id"]),
                 name="Watched child",
                 description="Should resolve IA parent",
                 hashes={"sha1": "d" * 40},
             )
 
-            matches = list_goldrush_matches(connection)
+            before_scan_matches = list_goldrush_matches(
+                connection,
+                user_id=int(user["id"]),
+            )
+            scan_result = scan_goldrush_matches(connection, user_id=int(user["id"]))
+            duplicate_scan_result = scan_goldrush_matches(
+                connection,
+                user_id=int(user["id"]),
+            )
+            matches = list_goldrush_matches(connection, user_id=int(user["id"]))
+            other_matches = list_goldrush_matches(
+                connection,
+                user_id=int(other_user["id"]),
+            )
 
+        self.assertEqual(before_scan_matches, [])
+        self.assertEqual(scan_result, {"matched": 1, "created": 1})
+        self.assertEqual(duplicate_scan_result, {"matched": 1, "created": 0})
         self.assertEqual(len(matches), 1)
+        self.assertEqual(other_matches, [])
         internet_archive = matches[0]["file"]["internet_archive"]
         self.assertIsNotNone(internet_archive)
         assert internet_archive is not None
@@ -540,6 +737,96 @@ class DatabaseTests(unittest.TestCase):
             "https://archive.org/details/ia-top-item",
         )
         self.assertEqual(internet_archive["file_name"], "ia-archive.zip")
+
+    def test_clear_goldrush_alerts_only_removes_current_user_rows(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"database-goldrush-clear-{uuid.uuid4().hex}.sqlite"
+        with closing(connect(db_path)) as connection:
+            user = create_user(
+                connection,
+                username="clear-user",
+                password="correct horse battery staple",
+                roles=["reader", "contributor"],
+            )
+            other_user = create_user(
+                connection,
+                username="clear-other",
+                password="correct horse battery staple",
+                roles=["reader", "contributor"],
+            )
+            upsert_file_identity(
+                connection,
+                display_name="watched.bin",
+                size_bytes=5,
+                hashes={"crc32": "11111111", "md5": "a" * 32, "sha1": "b" * 40},
+            )
+            create_goldrush_alert(
+                connection,
+                user_id=int(user["id"]),
+                name="Watched one",
+                description="First clear target",
+                hashes={"md5": "a" * 32},
+            )
+            create_goldrush_alert(
+                connection,
+                user_id=int(user["id"]),
+                name="Watched two",
+                description="Second clear target",
+                hashes={"sha1": "b" * 40},
+            )
+            other_alert = create_goldrush_alert(
+                connection,
+                user_id=int(other_user["id"]),
+                name="Watched one",
+                description="First clear target",
+                hashes={"md5": "a" * 32},
+            )
+            duplicate_other_alert = create_goldrush_alert(
+                connection,
+                user_id=int(other_user["id"]),
+                name="Watched one",
+                description="First clear target",
+                hashes={"md5": "a" * 32},
+            )
+            before_count = count_goldrush_alerts(connection, user_id=int(user["id"]))
+            other_before_count = count_goldrush_alerts(
+                connection,
+                user_id=int(other_user["id"]),
+            )
+            scan_goldrush_matches(connection, user_id=int(user["id"]))
+            scan_goldrush_matches(connection, user_id=int(other_user["id"]))
+            before_match_count = len(
+                list_goldrush_matches(connection, user_id=int(user["id"]))
+            )
+            other_before_match_count = len(
+                list_goldrush_matches(connection, user_id=int(other_user["id"]))
+            )
+            deleted = clear_goldrush_alerts(connection, user_id=int(user["id"]))
+            after_count = count_goldrush_alerts(connection, user_id=int(user["id"]))
+            other_after_count = count_goldrush_alerts(
+                connection,
+                user_id=int(other_user["id"]),
+            )
+            after_match_count = len(
+                list_goldrush_matches(connection, user_id=int(user["id"]))
+            )
+            other_after_match_count = len(
+                list_goldrush_matches(connection, user_id=int(other_user["id"]))
+            )
+            deleted_again = clear_goldrush_alerts(connection, user_id=int(user["id"]))
+
+        self.assertEqual(before_count, 2)
+        self.assertTrue(other_alert["created"])
+        self.assertFalse(duplicate_other_alert["created"])
+        self.assertEqual(other_before_count, 1)
+        self.assertEqual(before_match_count, 2)
+        self.assertEqual(other_before_match_count, 1)
+        self.assertEqual(deleted, 2)
+        self.assertEqual(after_count, 0)
+        self.assertEqual(other_after_count, 1)
+        self.assertEqual(after_match_count, 0)
+        self.assertEqual(other_after_match_count, 1)
+        self.assertEqual(deleted_again, 0)
 
 
 

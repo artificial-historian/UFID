@@ -60,6 +60,7 @@ class QueuedFile:
     needs_downloaded_identity: bool
     identity_metadata_status: str
     identity_metadata_missing: tuple[str, ...]
+    raw: dict[str, Any]
 
 
 class IAIngestState:
@@ -117,6 +118,7 @@ class IAIngestState:
                 status TEXT NOT NULL,
                 ufid_file_id INTEGER,
                 downloaded_path TEXT,
+                metadata_json TEXT,
                 needs_downloaded_identity INTEGER NOT NULL DEFAULT 0,
                 identity_metadata_status TEXT NOT NULL DEFAULT 'unknown',
                 identity_metadata_missing TEXT,
@@ -151,6 +153,7 @@ class IAIngestState:
             "needs_downloaded_identity",
             "INTEGER NOT NULL DEFAULT 0",
         )
+        self._ensure_file_column("metadata_json", "TEXT")
         self._ensure_file_column(
             "identity_metadata_status",
             "TEXT NOT NULL DEFAULT 'unknown'",
@@ -382,6 +385,7 @@ class IAIngestState:
                 attempts,
                 ufid_file_id,
                 error,
+                metadata_json,
                 needs_downloaded_identity,
                 identity_metadata_status,
                 identity_metadata_missing
@@ -408,6 +412,19 @@ class IAIngestState:
                 """,
                 (json.dumps(metadata, sort_keys=True), now, identifier),
             )
+
+    def get_item_metadata(self, identifier: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT metadata_json
+            FROM ia_ingest_item
+            WHERE identifier = ?
+            """,
+            (identifier,),
+        ).fetchone()
+        if row is None or row["metadata_json"] is None:
+            return None
+        return _decode_json_object(row["metadata_json"])
 
     def mark_item_status(
         self,
@@ -457,6 +474,7 @@ class IAIngestState:
                     sha1,
                     crc32,
                     url,
+                    metadata_json,
                     status,
                     ufid_file_id,
                     needs_downloaded_identity,
@@ -465,7 +483,7 @@ class IAIngestState:
                     first_seen_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_identifier, name) DO UPDATE SET
                     source = excluded.source,
                     format = excluded.format,
@@ -474,6 +492,7 @@ class IAIngestState:
                     sha1 = excluded.sha1,
                     crc32 = excluded.crc32,
                     url = excluded.url,
+                    metadata_json = excluded.metadata_json,
                     ufid_file_id = COALESCE(excluded.ufid_file_id, ia_ingest_file.ufid_file_id),
                     needs_downloaded_identity = excluded.needs_downloaded_identity,
                     identity_metadata_status = excluded.identity_metadata_status,
@@ -490,6 +509,7 @@ class IAIngestState:
                     ia_file.sha1,
                     ia_file.crc32,
                     url,
+                    json.dumps(ia_file.raw, sort_keys=True) if ia_file.raw else None,
                     ufid_file_id,
                     int(needs_downloaded_identity),
                     identity_metadata_status,
@@ -648,6 +668,7 @@ def _queued_file_from_row(row: sqlite3.Row) -> QueuedFile:
         needs_downloaded_identity=bool(row["needs_downloaded_identity"]),
         identity_metadata_status=str(row["identity_metadata_status"]),
         identity_metadata_missing=missing,
+        raw=_decode_json_object(row["metadata_json"]),
     )
 
 
@@ -661,3 +682,15 @@ def _decode_missing_identity(value: str | None) -> tuple[str, ...]:
     if not isinstance(payload, list):
         return ()
     return tuple(str(item) for item in payload if item)
+
+
+def _decode_json_object(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return dict(payload)

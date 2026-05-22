@@ -10,6 +10,7 @@ from ufid.database import (
     IDENTITY_CONFLICT_TYPES,
     OPTIONAL_HASH_ALGORITHMS,
     REQUIRED_HASH_ALGORITHMS,
+    REMOVAL_REQUEST_STATUSES,
     SUPPORTED_HASH_ALGORITHMS,
     IdentityConflict,
     UpsertResult,
@@ -19,6 +20,7 @@ from ufid.database import (
     _goldrush_alert_source_row,
     _goldrush_match_cte_sql,
     _goldrush_match_row,
+    _stored_goldrush_match_cte_sql,
     _hash_column,
     _metadata_entries,
     _normalize_goldrush_alert,
@@ -29,6 +31,7 @@ from ufid.database import (
     normalize_hashes,
 )
 from ufid.auth import (
+    DEFAULT_REGISTRATION_TOKEN_SECONDS,
     DEFAULT_SESSION_SECONDS,
     AuthenticatedUser,
     hash_password,
@@ -82,25 +85,225 @@ def create_user(
     password: str,
     roles: Sequence[str] = ("reader",),
     display_name: str | None = None,
+    activate: bool = True,
+    registration_completed: bool = True,
 ) -> dict[str, Any]:
     normalized_username = _normalize_username(username)
     normalized_roles = _normalize_roles(roles)
     password_hash = hash_password(password)
+    now = utc_now_iso()
+    activated_at = now if activate else None
+    completed_at = now if registration_completed else None
     with connection.transaction():
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO ufid_user_account (username, password_hash, display_name)
-                VALUES (%s, %s, %s)
+                INSERT INTO ufid_user_account (
+                    username,
+                    password_hash,
+                    display_name,
+                    activated_at,
+                    registration_completed_at
+                )
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (normalized_username, password_hash, display_name),
+                (
+                    normalized_username,
+                    password_hash,
+                    display_name,
+                    activated_at,
+                    completed_at,
+                ),
             )
             user_id = int(cursor.fetchone()["id"])
         _set_user_roles(connection, user_id=user_id, roles=normalized_roles)
-    user = get_user_by_username(connection, normalized_username)
+    user = get_user_by_id(connection, user_id)
     assert user is not None
     return user
+
+
+def register_user(
+    connection,
+    *,
+    username: str,
+    password: str,
+    display_name: str | None = None,
+) -> dict[str, Any]:
+    return create_user(
+        connection,
+        username=username,
+        password=password,
+        display_name=display_name,
+        roles=("reader",),
+        activate=False,
+        registration_completed=True,
+    )
+
+
+def create_invited_user(
+    connection,
+    *,
+    username: str,
+    roles: Sequence[str] = ("reader",),
+    display_name: str | None = None,
+    created_by_user_id: int | None = None,
+    token_seconds: int = DEFAULT_REGISTRATION_TOKEN_SECONDS,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    temporary_password = f"{new_session_token()}-{new_session_token()}"
+    with connection.transaction():
+        user = create_user(
+            connection,
+            username=username,
+            password=temporary_password,
+            display_name=display_name,
+            roles=roles,
+            activate=False,
+            registration_completed=False,
+        )
+        token, registration = create_registration_token(
+            connection,
+            user_id=int(user["id"]),
+            created_by_user_id=created_by_user_id,
+            seconds=token_seconds,
+        )
+    refreshed = get_user_by_id(connection, int(user["id"]))
+    assert refreshed is not None
+    return refreshed, token, registration
+
+
+def create_registration_token(
+    connection,
+    *,
+    user_id: int,
+    created_by_user_id: int | None = None,
+    seconds: int = DEFAULT_REGISTRATION_TOKEN_SECONDS,
+) -> tuple[str, dict[str, Any]]:
+    if get_user_by_id(connection, user_id) is None:
+        raise ValueError("user does not exist")
+    token = new_session_token()
+    token_hash = hash_session_token(token)
+    now = utc_now_iso()
+    expires_at = session_expiry_iso(seconds)
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE ufid_registration_token
+                SET used_at = %s
+                WHERE user_id = %s
+                  AND purpose = 'registration_completion'
+                  AND used_at IS NULL
+                """,
+                (now, user_id),
+            )
+            cursor.execute(
+                """
+                INSERT INTO ufid_registration_token (
+                    user_id,
+                    token_hash,
+                    purpose,
+                    created_at,
+                    expires_at,
+                    created_by_user_id
+                )
+                VALUES (%s, %s, 'registration_completion', %s, %s, %s)
+                RETURNING id
+                """,
+                (user_id, token_hash, now, expires_at, created_by_user_id),
+            )
+            token_id = int(cursor.fetchone()["id"])
+    registration = get_registration_token_by_id(connection, token_id)
+    assert registration is not None
+    return token, registration
+
+
+def get_registration_token_by_id(connection, token_id: int) -> dict[str, Any] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                user_id,
+                purpose,
+                created_at,
+                expires_at,
+                used_at,
+                created_by_user_id
+            FROM ufid_registration_token
+            WHERE id = %s
+            """,
+            (token_id,),
+        )
+        row = cursor.fetchone()
+    return None if row is None else _row_to_dict(row)
+
+
+def get_registration_token(connection, token: str) -> dict[str, Any] | None:
+    token_hash = hash_session_token(str(token or ""))
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                user_id,
+                purpose,
+                created_at,
+                expires_at,
+                used_at,
+                created_by_user_id
+            FROM ufid_registration_token
+            WHERE token_hash = %s
+              AND purpose = 'registration_completion'
+            """,
+            (token_hash,),
+        )
+        row = cursor.fetchone()
+    if row is None or row["used_at"]:
+        return None
+    if parse_timestamp(row["expires_at"]) <= utc_now():
+        return None
+    result = _row_to_dict(row)
+    result["user"] = get_user_by_id(connection, int(row["user_id"]))
+    return result
+
+
+def complete_registration(
+    connection,
+    *,
+    token: str,
+    password: str,
+    display_name: str | None = None,
+) -> dict[str, Any] | None:
+    registration = get_registration_token(connection, token)
+    if registration is None:
+        return None
+    user_id = int(registration["user_id"])
+    password_hash = hash_password(password)
+    now = utc_now_iso()
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE ufid_user_account
+                SET password_hash = %s,
+                    display_name = COALESCE(%s, display_name),
+                    activated_at = COALESCE(activated_at, %s),
+                    registration_completed_at = %s,
+                    disabled_at = NULL
+                WHERE id = %s
+                """,
+                (password_hash, display_name, now, now, user_id),
+            )
+            cursor.execute(
+                """
+                UPDATE ufid_registration_token
+                SET used_at = %s
+                WHERE id = %s
+                """,
+                (now, int(registration["id"])),
+            )
+    return get_user_by_id(connection, user_id)
 
 
 def authenticate_user(
@@ -110,7 +313,9 @@ def authenticate_user(
     password: str,
 ) -> dict[str, Any] | None:
     user = get_user_by_username(connection, username)
-    if user is None or user.get("disabled_at"):
+    if user is None or user.get("disabled_at") or not user.get("activated_at"):
+        return None
+    if not user.get("registration_completed_at"):
         return None
     with connection.cursor() as cursor:
         cursor.execute(
@@ -163,6 +368,10 @@ def create_session(
         roles=user.roles,
         session_id=session_id,
         expires_at=expires_at,
+        created_at=user.created_at,
+        activated_at=user.activated_at,
+        registration_completed_at=user.registration_completed_at,
+        disabled_at=user.disabled_at,
     )
 
 
@@ -180,6 +389,9 @@ def get_authenticated_user(connection, token: str | None) -> AuthenticatedUser |
                 u.id AS user_id,
                 u.username,
                 u.display_name,
+                u.created_at,
+                u.activated_at,
+                u.registration_completed_at,
                 u.disabled_at
             FROM ufid_session s
             JOIN ufid_user_account u ON u.id = s.user_id
@@ -189,6 +401,8 @@ def get_authenticated_user(connection, token: str | None) -> AuthenticatedUser |
         )
         row = cursor.fetchone()
     if row is None or row["revoked_at"] or row["disabled_at"]:
+        return None
+    if not row["activated_at"] or not row["registration_completed_at"]:
         return None
     if parse_timestamp(row["expires_at"]) <= utc_now():
         return None
@@ -206,6 +420,10 @@ def get_authenticated_user(connection, token: str | None) -> AuthenticatedUser |
         roles=tuple(get_user_roles(connection, int(row["user_id"]))),
         session_id=int(row["session_id"]),
         expires_at=_json_value(row["expires_at"]),
+        created_at=_json_value(row["created_at"]),
+        activated_at=_json_value(row["activated_at"]),
+        registration_completed_at=_json_value(row["registration_completed_at"]),
+        disabled_at=_json_value(row["disabled_at"]),
     )
 
 
@@ -232,18 +450,366 @@ def get_user_by_username(connection, username: str) -> dict[str, Any] | None:
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT id, username, display_name, created_at, disabled_at
+            SELECT
+                id,
+                username,
+                display_name,
+                created_at,
+                activated_at,
+                registration_completed_at,
+                disabled_at
             FROM ufid_user_account
             WHERE lower(username) = lower(%s)
             """,
             (normalized_username,),
         )
         row = cursor.fetchone()
-    if row is None:
+    return _user_row(connection, row)
+
+
+def get_user_by_id(connection, user_id: int) -> dict[str, Any] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                username,
+                display_name,
+                created_at,
+                activated_at,
+                registration_completed_at,
+                disabled_at
+            FROM ufid_user_account
+            WHERE id = %s
+            """,
+            (user_id,),
+        )
+        row = cursor.fetchone()
+    return _user_row(connection, row)
+
+
+def list_users(connection) -> list[dict[str, Any]]:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                username,
+                display_name,
+                created_at,
+                activated_at,
+                registration_completed_at,
+                disabled_at
+            FROM ufid_user_account
+            ORDER BY username
+            """
+        )
+        rows = cursor.fetchall()
+    return [
+        user
+        for row in rows
+        if (user := _user_row(connection, row, include_removal=True)) is not None
+    ]
+
+
+def set_user_activation(
+    connection,
+    *,
+    user_id: int,
+    active: bool,
+) -> dict[str, Any] | None:
+    if get_user_by_id(connection, user_id) is None:
         return None
-    user = _row_to_dict(row)
-    user["roles"] = get_user_roles(connection, int(row["id"]))
-    return user
+    now = utc_now_iso()
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            if active:
+                cursor.execute(
+                    """
+                    UPDATE ufid_user_account
+                    SET activated_at = COALESCE(activated_at, %s),
+                        disabled_at = NULL
+                    WHERE id = %s
+                    """,
+                    (now, user_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE ufid_user_account
+                    SET disabled_at = %s
+                    WHERE id = %s
+                    """,
+                    (now, user_id),
+                )
+                revoke_user_sessions(connection, user_id=user_id)
+    return get_user_by_id(connection, user_id)
+
+
+def update_user_roles(
+    connection,
+    *,
+    user_id: int,
+    roles: Sequence[str],
+) -> dict[str, Any] | None:
+    normalized_roles = _normalize_roles(roles)
+    if get_user_by_id(connection, user_id) is None:
+        return None
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM ufid_user_role WHERE user_id = %s",
+                (user_id,),
+            )
+        _set_user_roles(connection, user_id=user_id, roles=normalized_roles)
+    return get_user_by_id(connection, user_id)
+
+
+def delete_user(connection, user_id: int) -> bool:
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM ufid_user_account WHERE id = %s", (user_id,))
+            return cursor.rowcount > 0
+
+
+def change_user_password(
+    connection,
+    *,
+    user_id: int,
+    current_password: str,
+    new_password: str,
+    keep_token: str | None = None,
+) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT password_hash FROM ufid_user_account WHERE id = %s",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return False
+    if not verify_password(current_password, str(row["password_hash"])):
+        return False
+    password_hash = hash_password(new_password)
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE ufid_user_account SET password_hash = %s WHERE id = %s",
+                (password_hash, user_id),
+            )
+        revoke_user_sessions(connection, user_id=user_id, keep_token=keep_token)
+    return True
+
+
+def revoke_user_sessions(
+    connection,
+    *,
+    user_id: int,
+    keep_token: str | None = None,
+) -> int:
+    keep_hash = hash_session_token(keep_token) if keep_token else None
+    now = utc_now_iso()
+    with connection.cursor() as cursor:
+        if keep_hash:
+            cursor.execute(
+                """
+                UPDATE ufid_session
+                SET revoked_at = %s
+                WHERE user_id = %s
+                  AND revoked_at IS NULL
+                  AND token_hash != %s
+                """,
+                (now, user_id, keep_hash),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE ufid_session
+                SET revoked_at = %s
+                WHERE user_id = %s
+                  AND revoked_at IS NULL
+                """,
+                (now, user_id),
+            )
+        return max(int(cursor.rowcount if cursor.rowcount is not None else 0), 0)
+
+
+def request_user_removal(connection, *, user_id: int) -> dict[str, Any]:
+    existing = get_user_removal_request(connection, user_id, status="pending")
+    if existing is not None:
+        return existing
+    now = utc_now_iso()
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO ufid_user_removal_request (user_id, status, requested_at)
+                VALUES (%s, 'pending', %s)
+                RETURNING id
+                """,
+                (user_id, now),
+            )
+            request_id = int(cursor.fetchone()["id"])
+    request = get_user_removal_request_by_id(connection, request_id)
+    assert request is not None
+    return request
+
+
+def get_user_removal_request(
+    connection,
+    user_id: int,
+    *,
+    status: str | None = None,
+) -> dict[str, Any] | None:
+    status_filter = "AND status = %s" if status else ""
+    params: tuple[Any, ...] = (user_id, status) if status else (user_id,)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                id,
+                user_id,
+                status,
+                requested_at,
+                decided_at,
+                decided_by_user_id,
+                notes
+            FROM ufid_user_removal_request
+            WHERE user_id = %s
+              {status_filter}
+            ORDER BY requested_at DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        )
+        row = cursor.fetchone()
+    return _removal_request_row(connection, row)
+
+
+def get_user_removal_request_by_id(
+    connection,
+    request_id: int,
+) -> dict[str, Any] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                user_id,
+                status,
+                requested_at,
+                decided_at,
+                decided_by_user_id,
+                notes
+            FROM ufid_user_removal_request
+            WHERE id = %s
+            """,
+            (request_id,),
+        )
+        row = cursor.fetchone()
+    return _removal_request_row(connection, row)
+
+
+def list_user_removal_requests(
+    connection,
+    *,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    normalized_status = None
+    if status:
+        normalized_status = str(status).strip().lower()
+        if normalized_status not in REMOVAL_REQUEST_STATUSES:
+            allowed = ", ".join(REMOVAL_REQUEST_STATUSES)
+            raise ValueError(f"status must be one of: {allowed}")
+    where_sql = "WHERE status = %s" if normalized_status else ""
+    params: tuple[Any, ...] = (normalized_status,) if normalized_status else ()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                id,
+                user_id,
+                status,
+                requested_at,
+                decided_at,
+                decided_by_user_id,
+                notes
+            FROM ufid_user_removal_request
+            {where_sql}
+            ORDER BY requested_at DESC, id DESC
+            """,
+            params,
+        )
+        rows = cursor.fetchall()
+    return [
+        request
+        for row in rows
+        if (request := _removal_request_row(connection, row)) is not None
+    ]
+
+
+def block_user_removal_request(
+    connection,
+    *,
+    request_id: int,
+    decided_by_user_id: int,
+    notes: str | None = None,
+) -> dict[str, Any] | None:
+    request = get_user_removal_request_by_id(connection, request_id)
+    if request is None or request["status"] != "pending":
+        return None
+    now = utc_now_iso()
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE ufid_user_removal_request
+                SET status = 'blocked',
+                    decided_at = %s,
+                    decided_by_user_id = %s,
+                    notes = %s
+                WHERE id = %s
+                """,
+                (now, decided_by_user_id, notes, request_id),
+            )
+    return get_user_removal_request_by_id(connection, request_id)
+
+
+def approve_user_removal_request(
+    connection,
+    *,
+    request_id: int,
+    decided_by_user_id: int,
+    notes: str | None = None,
+) -> dict[str, Any] | None:
+    request = get_user_removal_request_by_id(connection, request_id)
+    if request is None or request["status"] != "pending":
+        return None
+    now = utc_now_iso()
+    user_id = int(request["user_id"])
+    result = {
+        **request,
+        "status": "approved",
+        "decided_at": now,
+        "decided_by_user_id": decided_by_user_id,
+        "notes": notes,
+        "deleted_user_id": user_id,
+    }
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE ufid_user_removal_request
+                SET status = 'approved',
+                    decided_at = %s,
+                    decided_by_user_id = %s,
+                    notes = %s
+                WHERE id = %s
+                """,
+                (now, decided_by_user_id, notes, request_id),
+            )
+            cursor.execute("DELETE FROM ufid_user_account WHERE id = %s", (user_id,))
+    return result
 
 
 def get_user_roles(connection, user_id: int) -> list[str]:
@@ -259,6 +825,53 @@ def get_user_roles(connection, user_id: int) -> list[str]:
             (user_id,),
         )
         return [str(row["name"]) for row in cursor.fetchall()]
+
+
+def _user_row(
+    connection,
+    row: Mapping[str, Any] | None,
+    *,
+    include_removal: bool = False,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    user = _row_to_dict(row)
+    user["roles"] = get_user_roles(connection, int(row["id"]))
+    user["status"] = _user_status(user)
+    if include_removal:
+        user["removal_request"] = get_user_removal_request(
+            connection,
+            int(row["id"]),
+        )
+    return user
+
+
+def _user_status(user: Mapping[str, Any]) -> str:
+    if user.get("disabled_at"):
+        return "inactive"
+    if not user.get("registration_completed_at"):
+        return "invited"
+    if not user.get("activated_at"):
+        return "pending_activation"
+    return "active"
+
+
+def _removal_request_row(
+    connection,
+    row: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    request = _row_to_dict(row)
+    request["user"] = get_user_by_id(connection, int(row["user_id"]))
+    if row["decided_by_user_id"] is not None:
+        request["decided_by"] = get_user_by_id(
+            connection,
+            int(row["decided_by_user_id"]),
+        )
+    else:
+        request["decided_by"] = None
+    return request
 
 
 def find_files_by_hash(
@@ -614,6 +1227,7 @@ def add_file_metadata(
 def create_goldrush_alert(
     connection,
     *,
+    user_id: int,
     name: str,
     description: str,
     hashes: Mapping[str, str | None],
@@ -634,14 +1248,21 @@ def create_goldrush_alert(
         }
     )
     with connection.transaction():
-        created = _insert_goldrush_alert(connection, normalized)
-    alert = _get_goldrush_alert_by_fingerprint(connection, normalized["fingerprint"])
-    assert alert is not None
+        _insert_goldrush_alert(connection, normalized)
+        alert = _get_goldrush_alert_by_fingerprint(connection, normalized["fingerprint"])
+        assert alert is not None
+        created = _insert_goldrush_user_alert(
+            connection,
+            user_id=user_id,
+            alert_id=int(alert["id"]),
+        )
     return {"alert": alert, "created": created}
 
 
 def import_goldrush_alerts(
     connection,
+    *,
+    user_id: int,
     alerts: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     received = list(alerts)
@@ -662,7 +1283,14 @@ def import_goldrush_alerts(
     created = 0
     with connection.transaction():
         for row in normalized_rows:
-            if _insert_goldrush_alert(connection, row):
+            _insert_goldrush_alert(connection, row)
+            alert = _get_goldrush_alert_by_fingerprint(connection, row["fingerprint"])
+            assert alert is not None
+            if _insert_goldrush_user_alert(
+                connection,
+                user_id=user_id,
+                alert_id=int(alert["id"]),
+            ):
                 created += 1
 
     return {
@@ -674,9 +1302,35 @@ def import_goldrush_alerts(
     }
 
 
+def clear_goldrush_alerts(connection, *, user_id: int) -> int:
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM ufid_goldrush_user_alert WHERE user_id = %s",
+                (user_id,),
+            )
+            deleted = max(int(cursor.rowcount if cursor.rowcount is not None else 0), 0)
+            cursor.execute(
+                "DELETE FROM ufid_goldrush_user_match WHERE user_id = %s",
+                (user_id,),
+            )
+            cursor.execute(
+                """
+                DELETE FROM ufid_goldrush_alert
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM ufid_goldrush_user_alert ua
+                    WHERE ua.alert_id = ufid_goldrush_alert.id
+                )
+                """
+            )
+            return deleted
+
+
 def list_goldrush_alerts(
     connection,
     *,
+    user_id: int,
     limit: int = 200,
     offset: int = 0,
     query: str | None = None,
@@ -687,13 +1341,15 @@ def list_goldrush_alerts(
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
-            SELECT *
-            FROM ufid_goldrush_alert a
+            SELECT a.*
+            FROM ufid_goldrush_user_alert ua
+            JOIN ufid_goldrush_alert a ON a.id = ua.alert_id
+            WHERE ua.user_id = %s
             {where_sql}
-            ORDER BY a.id DESC
+            ORDER BY ua.created_at DESC, a.id DESC
             LIMIT %s OFFSET %s
             """,
-            (*params, bounded_limit, bounded_offset),
+            (user_id, *params, bounded_limit, bounded_offset),
         )
         return [_goldrush_alert_row(row) for row in cursor.fetchall()]
 
@@ -701,6 +1357,7 @@ def list_goldrush_alerts(
 def count_goldrush_alerts(
     connection,
     *,
+    user_id: int,
     query: str | None = None,
 ) -> int:
     where_sql, params = _goldrush_alert_filter(query)
@@ -708,16 +1365,18 @@ def count_goldrush_alerts(
         cursor.execute(
             f"""
             SELECT COUNT(*) AS total
-            FROM ufid_goldrush_alert a
+            FROM ufid_goldrush_user_alert ua
+            JOIN ufid_goldrush_alert a ON a.id = ua.alert_id
+            WHERE ua.user_id = %s
             {where_sql}
             """,
-            params,
+            (user_id, *params),
         )
         row = cursor.fetchone()
     return int(row["total"] if row is not None else 0)
 
 
-def list_goldrush_alert_sources(connection) -> list[dict[str, Any]]:
+def list_goldrush_alert_sources(connection, *, user_id: int) -> list[dict[str, Any]]:
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
@@ -733,6 +1392,8 @@ def list_goldrush_alert_sources(connection) -> list[dict[str, Any]]:
                     NULLIF(a.source_type, '') AS source_type,
                     NULLIF(a.source_name, '') AS source_name
                 FROM ufid_goldrush_alert a
+                JOIN ufid_goldrush_user_alert ua ON ua.alert_id = a.id
+                WHERE ua.user_id = %s
             )
             SELECT
                 source_key,
@@ -746,14 +1407,102 @@ def list_goldrush_alert_sources(connection) -> list[dict[str, Any]]:
                 CASE WHEN source_key = 'manual' THEN 0 ELSE 1 END,
                 lower(label),
                 source_key
-            """
+            """,
+            (user_id,),
         )
         return [_goldrush_alert_source_row(row) for row in cursor.fetchall()]
+
+
+def scan_goldrush_matches(connection, *, user_id: int) -> dict[str, int]:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            {_goldrush_match_cte_sql(user_placeholder="%s")}
+            SELECT
+                m.alert_id,
+                m.file_id,
+                m.matched_crc32,
+                m.matched_md5,
+                m.matched_sha1,
+                m.matched_sha256,
+                m.matched_blake3,
+                (a.size_bytes IS NOT NULL) AS size_matched
+            FROM goldrush_match m
+            JOIN ufid_goldrush_alert a ON a.id = m.alert_id
+            ORDER BY a.id DESC, m.file_id DESC
+            """,
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+
+    created = 0
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            for row in rows:
+                cursor.execute(
+                    """
+                    INSERT INTO ufid_goldrush_user_match (
+                        user_id,
+                        alert_id,
+                        file_id,
+                        matched_crc32,
+                        matched_md5,
+                        matched_sha1,
+                        matched_sha256,
+                        matched_blake3,
+                        size_matched
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, alert_id, file_id) DO NOTHING
+                    RETURNING file_id
+                    """,
+                    (
+                        user_id,
+                        int(row["alert_id"]),
+                        int(row["file_id"]),
+                        bool(row["matched_crc32"]),
+                        bool(row["matched_md5"]),
+                        bool(row["matched_sha1"]),
+                        bool(row["matched_sha256"]),
+                        bool(row["matched_blake3"]),
+                        bool(row["size_matched"]),
+                    ),
+                )
+                if cursor.fetchone() is not None:
+                    created += 1
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE ufid_goldrush_user_match
+                        SET matched_crc32 = %s,
+                            matched_md5 = %s,
+                            matched_sha1 = %s,
+                            matched_sha256 = %s,
+                            matched_blake3 = %s,
+                            size_matched = %s
+                        WHERE user_id = %s
+                          AND alert_id = %s
+                          AND file_id = %s
+                        """,
+                        (
+                            bool(row["matched_crc32"]),
+                            bool(row["matched_md5"]),
+                            bool(row["matched_sha1"]),
+                            bool(row["matched_sha256"]),
+                            bool(row["matched_blake3"]),
+                            bool(row["size_matched"]),
+                            user_id,
+                            int(row["alert_id"]),
+                            int(row["file_id"]),
+                        ),
+                    )
+    return {"matched": len(rows), "created": created}
 
 
 def list_goldrush_matches(
     connection,
     *,
+    user_id: int,
     limit: int = 200,
     offset: int = 0,
     query: str | None = None,
@@ -765,7 +1514,7 @@ def list_goldrush_matches(
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
-            {_goldrush_match_cte_sql(include_sources=True)}
+            {_stored_goldrush_match_cte_sql(include_sources=True, user_placeholder="%s")}
             SELECT
                 a.id AS alert_id,
                 a.name AS alert_name,
@@ -808,7 +1557,8 @@ def list_goldrush_matches(
                 m.matched_sha1,
                 m.matched_sha256,
                 m.matched_blake3,
-                (a.size_bytes IS NOT NULL) AS size_matched,
+                m.size_matched,
+                m.found_at AS match_found_at,
                 s.source_file_id,
                 s.ia_identifier,
                 s.ia_item_url,
@@ -816,10 +1566,10 @@ def list_goldrush_matches(
                 s.ia_file_name
             {_goldrush_match_from_sql(include_sources=True)}
             {filter_sql}
-            ORDER BY a.id DESC, f.id DESC
+            ORDER BY m.found_at DESC, a.id DESC, f.id DESC
             LIMIT %s OFFSET %s
             """,
-            (*params, bounded_limit, bounded_offset),
+            (user_id, *params, bounded_limit, bounded_offset),
         )
         return [_goldrush_match_row(row) for row in cursor.fetchall()]
 
@@ -827,6 +1577,7 @@ def list_goldrush_matches(
 def count_goldrush_matches(
     connection,
     *,
+    user_id: int,
     query: str | None = None,
     source_keys: Sequence[str] | None = None,
 ) -> int:
@@ -834,12 +1585,12 @@ def count_goldrush_matches(
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
-            {_goldrush_match_cte_sql()}
+            {_stored_goldrush_match_cte_sql(user_placeholder="%s")}
             SELECT COUNT(*) AS total
             {_goldrush_match_from_sql()}
             {filter_sql}
             """,
-            params,
+            (user_id, *params),
         )
         row = cursor.fetchone()
     return int(row["total"] if row is not None else 0)
@@ -1144,6 +1895,20 @@ def _insert_goldrush_alert(connection, row: Mapping[str, Any]) -> bool:
         return cursor.fetchone() is not None
 
 
+def _insert_goldrush_user_alert(connection, *, user_id: int, alert_id: int) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO ufid_goldrush_user_alert (user_id, alert_id)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING alert_id
+            """,
+            (user_id, alert_id),
+        )
+        return cursor.fetchone() is not None
+
+
 def _get_goldrush_alert_by_fingerprint(
     connection,
     fingerprint: str,
@@ -1165,18 +1930,20 @@ def _goldrush_alert_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
     like = f"%{query}%"
     return (
         """
-        WHERE CAST(a.id AS TEXT) ILIKE %s
-           OR CAST(a.size_bytes AS TEXT) ILIKE %s
-           OR a.name ILIKE %s
-           OR a.description ILIKE %s
-           OR a.crc32 ILIKE %s
-           OR a.md5 ILIKE %s
-           OR a.sha1 ILIKE %s
-           OR a.sha256 ILIKE %s
-           OR a.blake3 ILIKE %s
-           OR a.source_type ILIKE %s
-           OR a.source_name ILIKE %s
-           OR a.source_detail ILIKE %s
+          AND (
+               CAST(a.id AS TEXT) ILIKE %s
+            OR CAST(a.size_bytes AS TEXT) ILIKE %s
+            OR a.name ILIKE %s
+            OR a.description ILIKE %s
+            OR a.crc32 ILIKE %s
+            OR a.md5 ILIKE %s
+            OR a.sha1 ILIKE %s
+            OR a.sha256 ILIKE %s
+            OR a.blake3 ILIKE %s
+            OR a.source_type ILIKE %s
+            OR a.source_name ILIKE %s
+            OR a.source_detail ILIKE %s
+          )
         """,
         (like, like, like, like, like, like, like, like, like, like, like, like),
     )

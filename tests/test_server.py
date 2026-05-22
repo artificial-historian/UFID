@@ -256,6 +256,13 @@ class ServerTests(unittest.TestCase):
         SCRATCH.mkdir(exist_ok=True)
         db_path = SCRATCH / f"server-goldrush-{uuid.uuid4().hex}.sqlite"
         self._create_test_user(db_path)
+        with closing(connect(db_path)) as connection:
+            create_user(
+                connection,
+                username="other",
+                password="correct horse battery staple",
+                roles=["reader", "contributor"],
+            )
         handler_class = type(
             "TestUFIDGoldrushRequestHandler",
             (UFIDRequestHandler,),
@@ -268,6 +275,10 @@ class ServerTests(unittest.TestCase):
 
         try:
             token = self._login(base_url)
+            other_token = self._post_json(
+                f"{base_url}/api/v1/auth/login",
+                {"username": "other", "password": "correct horse battery staple"},
+            )["token"]
             created_file = self._post_json(
                 f"{base_url}/api/v1/files",
                 {
@@ -292,6 +303,30 @@ class ServerTests(unittest.TestCase):
                 },
                 token=token,
             )
+            other_manual_alert = self._post_json(
+                f"{base_url}/api/v1/goldrush/alerts",
+                {
+                    "name": "Manual target",
+                    "description": "Manual watch entry",
+                    "size_bytes": 5,
+                    "hashes": {"md5": "a" * 32},
+                },
+                token=other_token,
+            )
+            duplicate_other_manual_alert = self._post_json(
+                f"{base_url}/api/v1/goldrush/alerts",
+                {
+                    "name": "Manual target",
+                    "description": "Manual watch entry",
+                    "size_bytes": 5,
+                    "hashes": {"md5": "a" * 32},
+                },
+                token=other_token,
+            )
+            other_alerts = self._get_json(
+                f"{base_url}/api/v1/goldrush/alerts",
+                token=other_token,
+            )
             xml_dat = f"""<?xml version="1.0"?>
 <datafile>
   <header>
@@ -313,12 +348,8 @@ class ServerTests(unittest.TestCase):
                 f"{base_url}/api/v1/goldrush/alerts?q=Goldrush",
                 token=token,
             )
-            manual_matches = self._get_json(
-                f"{base_url}/api/v1/goldrush/matches?q=Manual",
-                token=token,
-            )
-            dat_matches = self._get_json(
-                f"{base_url}/api/v1/goldrush/matches?q=Goldrush%20Set",
+            matches_before_search = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches",
                 token=token,
             )
             sources = self._get_json(
@@ -327,6 +358,24 @@ class ServerTests(unittest.TestCase):
             )
             source_keys = {source["source_key"] for source in sources["sources"]}
             dat_source_key = "logiqx-dat-xml|Goldrush Test DAT"
+            search_result = self._post_json(
+                f"{base_url}/api/v1/goldrush/matches/search",
+                {},
+                token=token,
+            )
+            duplicate_search_result = self._post_json(
+                f"{base_url}/api/v1/goldrush/matches/search",
+                {},
+                token=token,
+            )
+            manual_matches = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches?q=Manual",
+                token=token,
+            )
+            dat_matches = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches?q=Goldrush%20Set",
+                token=token,
+            )
             manual_source_matches = self._get_json(
                 f"{base_url}/api/v1/goldrush/matches?source_key=manual",
                 token=token,
@@ -345,6 +394,27 @@ class ServerTests(unittest.TestCase):
                     },
                     token=token,
                 )
+            cleared = self._post_json(
+                f"{base_url}/api/v1/goldrush/alerts",
+                {"action": "clear"},
+                token=token,
+            )
+            alerts_after_clear = self._get_json(
+                f"{base_url}/api/v1/goldrush/alerts",
+                token=token,
+            )
+            matches_after_clear = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches",
+                token=token,
+            )
+            sources_after_clear = self._get_json(
+                f"{base_url}/api/v1/goldrush/alert-sources",
+                token=token,
+            )
+            other_alerts_after_clear = self._get_json(
+                f"{base_url}/api/v1/goldrush/alerts",
+                token=other_token,
+            )
         finally:
             server.shutdown()
             server.server_close()
@@ -352,6 +422,9 @@ class ServerTests(unittest.TestCase):
 
         self.assertEqual(created_file["created"], True)
         self.assertTrue(manual_alert["created"])
+        self.assertTrue(other_manual_alert["created"])
+        self.assertFalse(duplicate_other_manual_alert["created"])
+        self.assertEqual(other_alerts["total_count"], 1)
         self.assertEqual(manual_alert["alert"]["hashes"]["md5"], "a" * 32)
         self.assertEqual(dat_import["source_name"], "Goldrush Test DAT")
         self.assertEqual(dat_import["parsed"], 1)
@@ -359,6 +432,14 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(alerts["total_count"], 1)
         self.assertEqual(alerts["alerts"][0]["name"], "Goldrush Set")
         self.assertEqual(alerts["alerts"][0]["description"], "Goldrush Test DAT")
+        self.assertEqual(matches_before_search["total_count"], 0)
+        self.assertEqual(search_result["search"], {"matched": 2, "created": 2})
+        self.assertEqual(search_result["total_count"], 2)
+        self.assertEqual(
+            duplicate_search_result["search"],
+            {"matched": 2, "created": 0},
+        )
+        self.assertEqual(duplicate_search_result["total_count"], 2)
         self.assertEqual(manual_matches["total_count"], 1)
         self.assertEqual(manual_matches["matches"][0]["file"]["id"], created_file["id"])
         self.assertEqual(manual_matches["matches"][0]["matched_algorithms"], ["md5"])
@@ -382,6 +463,11 @@ class ServerTests(unittest.TestCase):
         )
         self.assertEqual(raised.exception.code, 400)
         raised.exception.close()
+        self.assertEqual(cleared["deleted"], 2)
+        self.assertEqual(alerts_after_clear["total_count"], 0)
+        self.assertEqual(matches_after_clear["total_count"], 0)
+        self.assertEqual(sources_after_clear["count"], 0)
+        self.assertEqual(other_alerts_after_clear["total_count"], 1)
 
     def test_classic_logiqx_dat_parser(self) -> None:
         summary = parse_logiqx_dat(
@@ -494,6 +580,165 @@ game (
         raised.exception.close()
         self.assertTrue(session["authenticated"])
         self.assertEqual(session["user"]["username"], "tester")
+
+    def test_auth_registration_invitation_admin_and_removal_flow(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"server-user-lifecycle-{uuid.uuid4().hex}.sqlite"
+        self._create_test_user(db_path)
+        handler_class = type(
+            "TestUFIDUserLifecycleRequestHandler",
+            (UFIDRequestHandler,),
+            {"db_path": db_path, "web_root": ROOT / "web"},
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+        try:
+            admin_token = self._login(base_url)
+            registered = self._post_json(
+                f"{base_url}/api/v1/auth/register",
+                {
+                    "username": "self-register",
+                    "password": "correct horse battery staple",
+                },
+            )
+            with self.assertRaises(HTTPError) as inactive_login:
+                self._post_json(
+                    f"{base_url}/api/v1/auth/login",
+                    {
+                        "username": "self-register",
+                        "password": "correct horse battery staple",
+                    },
+                )
+            activated = self._post_json(
+                f"{base_url}/api/v1/auth/users/{registered['user']['id']}/activate",
+                {},
+                token=admin_token,
+            )
+            self_registered_token = self._post_json(
+                f"{base_url}/api/v1/auth/login",
+                {
+                    "username": "self-register",
+                    "password": "correct horse battery staple",
+                },
+            )["token"]
+
+            invited = self._post_json(
+                f"{base_url}/api/v1/auth/users",
+                {
+                    "username": "invitee",
+                    "display_name": "Invitee",
+                    "roles": ["reader", "contributor"],
+                },
+                token=admin_token,
+            )
+            updated_invitee_roles = self._post_json(
+                f"{base_url}/api/v1/auth/users/{invited['user']['id']}/roles",
+                {"roles": ["reader", "curator"]},
+                token=admin_token,
+            )
+            with self.assertRaises(HTTPError) as self_role_removal:
+                self._post_json(
+                    f"{base_url}/api/v1/auth/users/1/roles",
+                    {"roles": ["reader"]},
+                    token=admin_token,
+                )
+            registration = invited["registration"]
+            validated = self._get_json(
+                f"{base_url}/api/v1/auth/registration/validate?token={registration['token']}"
+            )
+            completed = self._post_json(
+                f"{base_url}/api/v1/auth/registration/complete",
+                {
+                    "token": registration["token"],
+                    "password": "invitee correct horse password",
+                },
+            )
+            invitee_token = completed["token"]
+            password_changed = self._post_json(
+                f"{base_url}/api/v1/auth/me/password",
+                {
+                    "current_password": "invitee correct horse password",
+                    "new_password": "invitee better horse password",
+                },
+                token=invitee_token,
+            )
+            removal = self._post_json(
+                f"{base_url}/api/v1/auth/me/removal-request",
+                {},
+                token=invitee_token,
+            )
+            pending_removals = self._get_json(
+                f"{base_url}/api/v1/auth/removal-requests",
+                token=admin_token,
+            )
+            blocked = self._post_json(
+                f"{base_url}/api/v1/auth/removal-requests/{removal['request']['id']}/block",
+                {},
+                token=admin_token,
+            )
+            users = self._get_json(f"{base_url}/api/v1/auth/users", token=admin_token)
+            removee = self._post_json(
+                f"{base_url}/api/v1/auth/users",
+                {
+                    "username": "removee",
+                    "password": "removee correct horse password",
+                    "roles": ["reader"],
+                },
+                token=admin_token,
+            )
+            removee_token = self._post_json(
+                f"{base_url}/api/v1/auth/login",
+                {
+                    "username": "removee",
+                    "password": "removee correct horse password",
+                },
+            )["token"]
+            removee_request = self._post_json(
+                f"{base_url}/api/v1/auth/me/removal-request",
+                {},
+                token=removee_token,
+            )
+            approved = self._post_json(
+                f"{base_url}/api/v1/auth/removal-requests/{removee_request['request']['id']}/approve",
+                {},
+                token=admin_token,
+            )
+            with self.assertRaises(HTTPError) as removed_login:
+                self._post_json(
+                    f"{base_url}/api/v1/auth/login",
+                    {
+                        "username": "removee",
+                        "password": "removee correct horse password",
+                    },
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(inactive_login.exception.code, 401)
+        inactive_login.exception.close()
+        self.assertTrue(registered["requires_activation"])
+        self.assertEqual(activated["user"]["status"], "active")
+        self.assertTrue(self_registered_token)
+        self.assertTrue(registration["completion_url"].startswith(base_url))
+        self.assertEqual(updated_invitee_roles["user"]["roles"], ["curator", "reader"])
+        self.assertEqual(self_role_removal.exception.code, 400)
+        self_role_removal.exception.close()
+        self.assertEqual(validated["registration"]["user"]["username"], "invitee")
+        self.assertEqual(completed["user"]["username"], "invitee")
+        self.assertTrue(password_changed["changed"])
+        self.assertEqual(removal["request"]["status"], "pending")
+        self.assertEqual(pending_removals["count"], 1)
+        self.assertEqual(blocked["request"]["status"], "blocked")
+        self.assertGreaterEqual(users["count"], 3)
+        self.assertEqual(removee["user"]["status"], "active")
+        self.assertEqual(approved["request"]["status"], "approved")
+        self.assertEqual(removed_login.exception.code, 401)
+        removed_login.exception.close()
 
     def test_local_automation_token_can_write_without_persisted_session(self) -> None:
         SCRATCH.mkdir(exist_ok=True)

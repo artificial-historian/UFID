@@ -219,6 +219,14 @@ label {
   padding: 18px clamp(12px, 3vw, 28px) 28px;
 }
 
+.account-workspace {
+  display: grid;
+  gap: 18px;
+  width: min(1280px, 100%);
+  margin: 0 auto;
+  padding: 18px clamp(12px, 3vw, 28px) 28px;
+}
+
 .panel {
   min-width: 0;
   border: 1px solid var(--line);
@@ -304,12 +312,113 @@ label {
 }
 
 .goldrush-form,
-.goldrush-import {
+.goldrush-import,
+.account-form {
   display: grid;
   gap: 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 14px;
+}
+
+.account-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+
+.account-grid[hidden],
+.account-form[hidden] {
+  display: none;
+}
+
+.profile-details p,
+.link-result p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.role-grid label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  color: var(--ink);
+}
+
+.role-grid input {
+  min-height: auto;
+  width: auto;
+}
+
+.table-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(110px, 1fr));
+  gap: 6px 10px;
+}
+
+.table-role-grid label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 28px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.table-role-grid input {
+  min-height: auto;
+  width: auto;
+}
+
+.link-result {
+  display: grid;
+  gap: 10px;
+}
+
+.admin-table-section {
+  margin-top: 18px;
+}
+
+.admin-table-section h3 {
+  margin-bottom: 8px;
+}
+
+.account-table-shell {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.account-table {
+  min-width: 920px;
+}
+
+.account-table th {
+  background: #f9fbfd;
+}
+
+.account-table th:nth-child(1),
+.account-table td:nth-child(1) {
+  width: 220px;
+}
+
+.account-table th:nth-child(5),
+.account-table td:nth-child(5) {
+  width: 310px;
+}
+
+.table-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .hash-entry-grid {
@@ -320,6 +429,17 @@ label {
 
 .goldrush-toolbar {
   margin-bottom: 12px;
+}
+
+.danger-button {
+  border-color: #f2b8b5;
+  background: #fff5f4;
+  color: #b42318;
+}
+
+.danger-button:hover:not(:disabled) {
+  border-color: #d92d20;
+  background: #fee4e2;
 }
 
 .source-filter-bar {
@@ -978,6 +1098,7 @@ td {
   .manual-lookup,
   .browse-toolbar,
   .goldrush-grid,
+  .account-grid,
   .hash-entry-grid,
   .files-heading,
   .files-toolbar,
@@ -1017,6 +1138,14 @@ td {
   .files-heading > div:first-child {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .role-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .table-role-grid {
+    grid-template-columns: 1fr;
   }
 
   th:first-child,

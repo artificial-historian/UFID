@@ -102,7 +102,7 @@ Useful options:
 ```powershell
 .\scripts\start_windows_local_ia_discovery.ps1 -Collection software -MaxItems 1000
 .\scripts\start_windows_local_ia_discovery.ps1 -Query "collection:software AND format:ZIP" -MaxItems 500
-.\scripts\start_windows_local_ia_discovery.ps1 -UserAgent "UFID-IA-Ingest/0.7.0 (contact: you@example.com)"
+.\scripts\start_windows_local_ia_discovery.ps1 -UserAgent "UFID-IA-Ingest/0.8 (contact: you@example.com)"
 .\scripts\start_windows_local_ia_discovery.ps1 -Port 8876 -PortScanCount 1
 .\scripts\start_windows_local_ia_discovery.ps1 -CreateAdmin -AdminUsername admin
 .\scripts\start_windows_local_ia_discovery.ps1 -Debug -MaxItems 100
@@ -124,6 +124,10 @@ The SQLite schema mirrors the PostgreSQL model for current local features:
 - `ufid_role`
 - `ufid_user_role`
 - `ufid_session`
+- `ufid_registration_token`
+- `ufid_user_removal_request`
+- `ufid_goldrush_user_alert`
+- `ufid_goldrush_user_match`
 
 The PostgreSQL backend additionally includes `ufid_audit_log` for server-side
 auditing.

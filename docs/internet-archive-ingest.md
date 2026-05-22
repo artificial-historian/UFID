@@ -82,9 +82,12 @@ This mode:
 - fetches `/metadata/{identifier}?extended_err=1`;
 - stores item metadata JSON in the state DB;
 - stores each IA file row with declared size, `crc32`, `md5`, `sha1`, source,
-  format, and stable download URL;
+  format, stable download URL, and the raw IA file metadata JSON needed for
+  later UFID enrichment;
 - inserts/enriches UFID records immediately for rows with complete declared
   `size`, `crc32`, `md5`, and `sha1`;
+- adds all IA item/file metadata not already mapped to UFID's compact IA
+  provenance fields as UFID metadata rows named `org.archive-*`;
 - marks each file row with `needs_downloaded_identity` when the IA metadata is
   missing any part of UFID's required identity tuple: size, `crc32`, `md5`, or
   `sha1`;
@@ -154,7 +157,7 @@ Use a descriptive Internet Archive User-Agent:
 ufid ia-ingest `
   --backend https://ufid.example.com `
   --collection software `
-  --user-agent "UFID-IA-Ingest/0.7.0 (gpt-5; contact: you@example.com)"
+  --user-agent "UFID-IA-Ingest/0.8 (gpt-5; contact: you@example.com)"
 ```
 
 Do not use browser-spoofed or stealth User-Agent strings. A clear tool name and
@@ -211,12 +214,17 @@ marked done without download unless they are archive containers that need
 member expansion. Plain single-file compression derivatives such as
 `*_hocr.html.gz` are not archive-scan candidates by default. Crawl index/data
 files ending in `.cdx.gz` or `.warc.gz` are always treated as non-archive files.
+Internet Archive-generated artifact files such as `*_files.xml`,
+`*_meta.sqlite`, and `*_meta.xml` are skipped by default during IA metadata
+harvesting and download processing because UFID already records the useful IA
+context as metadata. Pass `--ia-artifacts` to include those files as UFID file
+records.
 
 Useful limiting flags:
 
 ```powershell
 --original-only
---skip-metadata-files
+--ia-artifacts
 --max-file-bytes 1073741824
 --min-size 1M
 --max-size 2G

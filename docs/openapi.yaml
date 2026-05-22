@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: UFID API
-  version: 0.7.0
+  version: 0.8
 servers:
   - url: https://ufid.example.com
 paths:
@@ -154,7 +154,7 @@ paths:
                 $ref: "#/components/schemas/ConflictError"
   /api/v1/goldrush/alerts:
     get:
-      summary: Browse Goldrush alert entries
+      summary: Browse the current user's Goldrush alert entries
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -202,7 +202,7 @@ paths:
                       - integer
                       - "null"
     post:
-      summary: Create a Goldrush alert entry
+      summary: Create a Goldrush alert entry for the current user
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -211,14 +211,18 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/GoldrushAlertInput"
+              oneOf:
+                - $ref: "#/components/schemas/GoldrushAlertInput"
+                - $ref: "#/components/schemas/GoldrushAlertClearRequest"
       responses:
         "200":
-          description: Alert already existed
+          description: Alert already existed or alerts erased
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GoldrushAlertResult"
+                oneOf:
+                  - $ref: "#/components/schemas/GoldrushAlertResult"
+                  - $ref: "#/components/schemas/GoldrushAlertClearResult"
         "201":
           description: Alert created
           content:
@@ -227,9 +231,21 @@ paths:
                 $ref: "#/components/schemas/GoldrushAlertResult"
         "400":
           $ref: "#/components/responses/Error"
+    delete:
+      summary: Erase the current user's Goldrush alert entries
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Goldrush alerts erased
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GoldrushAlertClearResult"
   /api/v1/goldrush/import-dat:
     post:
-      summary: Import Logiqx DAT entries into Goldrush alerts
+      summary: Import Logiqx DAT entries into the current user's Goldrush alerts
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -254,9 +270,22 @@ paths:
                 $ref: "#/components/schemas/GoldrushImportResult"
         "400":
           $ref: "#/components/responses/Error"
+  /api/v1/goldrush/alerts/clear:
+    post:
+      summary: Erase the current user's Goldrush alert entries
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Goldrush alerts erased
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GoldrushAlertClearResult"
   /api/v1/goldrush/alert-sources:
     get:
-      summary: List Goldrush alert sources for match filtering
+      summary: List the current user's Goldrush alert sources for match filtering
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -277,7 +306,7 @@ paths:
                     type: integer
   /api/v1/goldrush/matches:
     get:
-      summary: List current UFID records matching Goldrush alerts
+      summary: List stored UFID matches for the current user's Goldrush alerts
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -333,6 +362,19 @@ paths:
                     type:
                       - integer
                       - "null"
+  /api/v1/goldrush/matches/search:
+    post:
+      summary: Search and store matches for the current user's Goldrush alerts
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Goldrush match search result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GoldrushMatchSearchResult"
   /api/v1/files/{file_id}:
     get:
       summary: Load one file record
@@ -503,8 +545,28 @@ paths:
                   revoked:
                     type: boolean
   /api/v1/auth/users:
+    get:
+      summary: List users
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: User list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users, count]
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AuthUser"
+                  count:
+                    type: integer
     post:
-      summary: Create a user
+      summary: Create a user or invitation link
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -514,12 +576,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [username, password, roles]
+              required: [username, roles]
               properties:
                 username:
                   type: string
                 password:
                   type: string
+                  description: When omitted, an invitation link is generated.
                 display_name:
                   type:
                     - string
@@ -540,7 +603,320 @@ paths:
                 properties:
                   user:
                     $ref: "#/components/schemas/AuthUser"
+                  registration:
+                    $ref: "#/components/schemas/RegistrationLink"
+  /api/v1/auth/register:
+    post:
+      summary: Register a user pending admin activation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+                display_name:
+                  type:
+                    - string
+                    - "null"
+      responses:
+        "201":
+          description: Registered user
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [registered, requires_activation, user]
+                properties:
+                  registered:
+                    type: boolean
+                  requires_activation:
+                    type: boolean
+                  user:
+                    $ref: "#/components/schemas/AuthUser"
+  /api/v1/auth/registration/validate:
+    get:
+      summary: Validate a registration link token
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Registration link
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [registration]
+                properties:
+                  registration:
+                    $ref: "#/components/schemas/RegistrationLink"
+  /api/v1/auth/registration/complete:
+    post:
+      summary: Complete invited registration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token:
+                  type: string
+                password:
+                  type: string
+                display_name:
+                  type:
+                    - string
+                    - "null"
+      responses:
+        "200":
+          description: Completed registration and created session
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [completed, authenticated, token, token_type, user]
+                properties:
+                  completed:
+                    type: boolean
+                  authenticated:
+                    type: boolean
+                  token:
+                    type: string
+                  token_type:
+                    type: string
+                    enum: [Bearer]
+                  expires_at:
+                    type: string
+                  user:
+                    $ref: "#/components/schemas/AuthUser"
+  /api/v1/auth/me:
+    get:
+      summary: Load current user profile
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: User profile
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user:
+                    $ref: "#/components/schemas/AuthUser"
+                  removal_request:
+                    $ref: "#/components/schemas/RemovalRequest"
+  /api/v1/auth/me/password:
+    post:
+      summary: Change current user password
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password:
+                  type: string
+                new_password:
+                  type: string
+      responses:
+        "200":
+          description: Password changed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [changed]
+                properties:
+                  changed:
+                    type: boolean
+  /api/v1/auth/me/removal-request:
+    post:
+      summary: Request current user removal
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "201":
+          description: Removal request
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [request]
+                properties:
+                  request:
+                    $ref: "#/components/schemas/RemovalRequest"
+  /api/v1/auth/users/{user_id}/activate:
+    post:
+      summary: Activate a user
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          $ref: "#/components/responses/UserResult"
+  /api/v1/auth/users/{user_id}/deactivate:
+    post:
+      summary: Deactivate a user
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          $ref: "#/components/responses/UserResult"
+  /api/v1/auth/users/{user_id}/roles:
+    post:
+      summary: Replace a user's roles
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roles]
+              properties:
+                roles:
+                  type: array
+                  items:
+                    type: string
+                    enum: [reader, contributor, curator, admin]
+      responses:
+        "200":
+          $ref: "#/components/responses/UserResult"
+  /api/v1/auth/users/{user_id}/invite:
+    post:
+      summary: Generate a registration link for a user
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          description: Registration link
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [registration]
+                properties:
+                  registration:
+                    $ref: "#/components/schemas/RegistrationLink"
+  /api/v1/auth/users/{user_id}:
+    delete:
+      summary: Delete a user
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          description: User deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted, user_id]
+                properties:
+                  deleted:
+                    type: boolean
+                  user_id:
+                    type: integer
+  /api/v1/auth/removal-requests:
+    get:
+      summary: List user removal requests
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, approved, blocked]
+            default: pending
+      responses:
+        "200":
+          description: Removal request list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requests, count]
+                properties:
+                  requests:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RemovalRequest"
+                  count:
+                    type: integer
+  /api/v1/auth/removal-requests/{request_id}/approve:
+    post:
+      summary: Approve user removal
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          $ref: "#/components/responses/RemovalRequestResult"
+  /api/v1/auth/removal-requests/{request_id}/block:
+    post:
+      summary: Block user removal
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          $ref: "#/components/responses/RemovalRequestResult"
 components:
+  parameters:
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    RequestId:
+      name: request_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
   securitySchemes:
     bearerAuth:
       type: http
@@ -580,6 +956,26 @@ components:
             properties:
               created:
                 type: boolean
+    UserResult:
+      description: User result
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [user]
+            properties:
+              user:
+                $ref: "#/components/schemas/AuthUser"
+    RemovalRequestResult:
+      description: Removal request result
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [request]
+            properties:
+              request:
+                $ref: "#/components/schemas/RemovalRequest"
   schemas:
     HashAlgorithm:
       type: string
@@ -684,6 +1080,21 @@ components:
           $ref: "#/components/schemas/GoldrushAlert"
         created:
           type: boolean
+          description: True when the alert was newly added to the current user's set.
+    GoldrushAlertClearRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [clear]
+    GoldrushAlertClearResult:
+      type: object
+      required: [deleted]
+      properties:
+        deleted:
+          type: integer
+          description: Number of alerts removed from the current user's set.
     GoldrushAlertSource:
       type: object
       required: [source_key, label, alert_count]
@@ -795,6 +1206,24 @@ components:
             $ref: "#/components/schemas/HashAlgorithm"
         size_matched:
           type: boolean
+        found_at:
+          type:
+            - string
+            - "null"
+    GoldrushMatchSearchResult:
+      type: object
+      required: [search, total_count]
+      properties:
+        search:
+          type: object
+          required: [matched, created]
+          properties:
+            matched:
+              type: integer
+            created:
+              type: integer
+        total_count:
+          type: integer
     FileUpsert:
       type: object
       required: [size_bytes, hashes]
@@ -968,6 +1397,62 @@ components:
             conflict_type:
               type: string
               enum: [optional_hash_mismatch, required_hash_overlap]
+    RegistrationLink:
+      type: object
+      required: [id, user_id, purpose, created_at, expires_at]
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        purpose:
+          type: string
+          enum: [registration_completion]
+        created_at:
+          type: string
+        expires_at:
+          type: string
+        used_at:
+          type:
+            - string
+            - "null"
+        token:
+          type: string
+        completion_url:
+          type: string
+        user:
+          $ref: "#/components/schemas/AuthUser"
+    RemovalRequest:
+      type: object
+      required: [id, user_id, status, requested_at]
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        status:
+          type: string
+          enum: [pending, approved, blocked]
+        requested_at:
+          type: string
+        decided_at:
+          type:
+            - string
+            - "null"
+        decided_by_user_id:
+          type:
+            - integer
+            - "null"
+        notes:
+          type:
+            - string
+            - "null"
+        deleted_user_id:
+          type: integer
+        user:
+          $ref: "#/components/schemas/AuthUser"
+        decided_by:
+          $ref: "#/components/schemas/AuthUser"
     AuthUser:
       type: object
       required: [id, username, roles]
@@ -985,6 +1470,25 @@ components:
           items:
             type: string
             enum: [reader, contributor, curator, admin]
+        status:
+          type: string
+          enum: [active, inactive, invited, pending_activation]
+        created_at:
+          type:
+            - string
+            - "null"
+        activated_at:
+          type:
+            - string
+            - "null"
+        registration_completed_at:
+          type:
+            - string
+            - "null"
+        disabled_at:
+          type:
+            - string
+            - "null"
         session_id:
           type:
             - integer

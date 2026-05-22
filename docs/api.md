@@ -2,15 +2,17 @@
 
 The HTTP API is versioned under `/api/v1`.
 
-All `/api/v1` endpoints require authentication except login and session
-inspection. Clients authenticate with either:
+All `/api/v1` endpoints require authentication except registration, invitation
+completion, login, and session inspection. Clients authenticate with either:
 
 - an HttpOnly `ufid_session` cookie issued by `POST /api/v1/auth/login`, used by
   the browser UI;
 - an `Authorization: Bearer <token>` header, used by CLI applications.
 
-Read endpoints require `reader`. Write endpoints require `contributor`. Creating
-users requires `admin`.
+Read endpoints require `reader`. Write endpoints that create or change
+user-managed data require `contributor`; the Goldrush match search endpoint uses
+`reader` because it materializes a derived cache for the current user's own
+alerts. Managing users and removal requests requires `admin`.
 
 Usernames are stored as canonical lowercase values. Login is therefore
 case-insensitive for users created through the UFID tools/API.
@@ -67,21 +69,86 @@ Authorization: Bearer <token>
 Revokes the current session and clears the browser cookie.
 
 ```http
-POST /api/v1/auth/users
-Authorization: Bearer <admin-token>
+POST /api/v1/auth/register
 Content-Type: application/json
 ```
 
-Creates a user:
+Creates a self-registered reader account. The account cannot log in until an
+admin activates it:
 
 ```json
 {
   "username": "bob",
   "password": "correct horse battery staple",
+  "display_name": "Bob"
+}
+```
+
+```http
+POST /api/v1/auth/registration/complete
+Content-Type: application/json
+```
+
+Completes an admin-created registration link, sets the user's password, activates
+the account, creates a session, and sets the browser cookie:
+
+```json
+{
+  "token": "registration-token-from-admin-link",
+  "password": "correct horse battery staple",
+  "display_name": "Bob"
+}
+```
+
+```http
+GET /api/v1/auth/me
+POST /api/v1/auth/me/password
+POST /api/v1/auth/me/removal-request
+Authorization: Bearer <token>
+```
+
+Registered users can load their profile, change their password, and request
+account removal. Password changes require the current password and revoke other
+active sessions for the account.
+
+```http
+POST /api/v1/auth/users
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+```
+
+Creates a user. If `password` is omitted, the server creates an inactive invited
+user and returns a one-time registration link:
+
+```json
+{
+  "username": "bob",
   "display_name": "Bob",
   "roles": ["reader", "contributor"]
 }
 ```
+
+Admin user lifecycle endpoints:
+
+```http
+GET /api/v1/auth/users
+POST /api/v1/auth/users/{user_id}/activate
+POST /api/v1/auth/users/{user_id}/deactivate
+POST /api/v1/auth/users/{user_id}/roles
+POST /api/v1/auth/users/{user_id}/invite
+DELETE /api/v1/auth/users/{user_id}
+GET /api/v1/auth/removal-requests?status=pending
+POST /api/v1/auth/removal-requests/{request_id}/approve
+POST /api/v1/auth/removal-requests/{request_id}/block
+Authorization: Bearer <admin-token>
+```
+
+`POST /api/v1/auth/users/{user_id}/roles` accepts a JSON body such as
+`{"roles": ["reader", "contributor"]}` and replaces the user's assigned roles.
+Admins cannot remove their own `admin` role.
+
+Approving a removal request deletes that user account and all dependent sessions,
+roles, registration tokens, and pending removal rows through database cascades.
 
 ## Search By Hash
 
@@ -197,6 +264,10 @@ Returns:
 
 ## Goldrush Alerts
 
+Goldrush alerts and stored matches are scoped to the authenticated registered
+user. Creating, importing, listing, searching, matching, and clearing alerts
+only affects that user's alert set.
+
 ```http
 POST /api/v1/goldrush/alerts
 Content-Type: application/json
@@ -237,23 +308,76 @@ set name as the alert name and the DAT header name as the alert description.
 ```
 
 ```http
+POST /api/v1/goldrush/alerts
+Content-Type: application/json
+Authorization: Bearer <token>
+```
+
+With an `action` payload, erases the current user's Goldrush alerts and returns
+the number removed:
+
+```json
+{
+  "action": "clear"
+}
+```
+
+Response:
+
+```json
+{
+  "deleted": 2
+}
+```
+
+`POST /api/v1/goldrush/alerts/clear` is accepted as a compatibility alias.
+`DELETE /api/v1/goldrush/alerts` is also accepted by current servers for API
+clients that prefer a method matching the operation.
+
+```http
+DELETE /api/v1/goldrush/alerts
+Authorization: Bearer <token>
+```
+
+```http
 GET /api/v1/goldrush/alerts?limit=200&offset=0&q=<filter>
 GET /api/v1/goldrush/alert-sources
 GET /api/v1/goldrush/matches?limit=200&offset=0&q=<filter>&source_key=<source>
 Authorization: Bearer <token>
 ```
 
-The `alert-sources` endpoint returns source buckets for match filtering. Manual
-alerts use `source_key=manual`; imported alerts use a stable source key derived
-from their import type and source name. The matches endpoint accepts repeated
-`source_key` parameters to restrict results to one or more alert sources.
+The `alert-sources` endpoint returns source buckets for the current user's match
+filtering. Manual alerts use `source_key=manual`; imported alerts use a stable
+source key derived from their import type and source name. The matches endpoint
+accepts repeated `source_key` parameters to restrict stored results to one or
+more alert sources in the current user's set.
 
-The matches endpoint returns existing UFID records whose stored hashes match a
-Goldrush alert. If the alert has `size_bytes`, the UFID record must match that
-exact size as well. When UFID can trace the matched file to Internet Archive
-metadata, the match file includes an `internet_archive` object with the IA item
-URL. For archive members, that object points to the topmost archive parent that
-was ingested from IA.
+```http
+POST /api/v1/goldrush/matches/search
+Content-Type: application/json
+Authorization: Bearer <token>
+```
+
+Searches current UFID records against the current user's alerts, stores newly
+found matches, and returns the number found and newly inserted. Re-running the
+same search does not create duplicate stored match rows.
+
+```json
+{
+  "search": {
+    "matched": 2,
+    "created": 1
+  },
+  "total_count": 7
+}
+```
+
+The matches endpoint loads stored results only. A match is stored when an
+existing UFID record has a stored hash matching a Goldrush alert. If the alert
+has `size_bytes`, the UFID record must match that exact size as well. When UFID
+can trace the matched file to Internet Archive metadata, the match file includes
+an `internet_archive` object with the IA item URL. For archive members, that
+object points to the topmost archive parent that was ingested from IA.
 
 ## Add Or Enrich File Identity
 
@@ -413,9 +537,11 @@ The local and PostgreSQL servers serve packaged web assets by default:
 GET /
 GET /files.html
 GET /goldrush.html
+GET /account.html
 GET /app.js
 GET /files.js
 GET /goldrush.js
+GET /account.js
 GET /styles.css
 ```
 

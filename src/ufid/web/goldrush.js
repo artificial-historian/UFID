@@ -16,6 +16,7 @@ const state = {
   matchesFilter: "",
   alertsRequestId: 0,
   matchesRequestId: 0,
+  clearingAlerts: false,
   matchesLoadingStartedAt: 0,
   sourceOptions: [],
   selectedSourceKeys: [],
@@ -40,6 +41,7 @@ const alertsPreviousButton = document.querySelector("#alertsPreviousButton");
 const alertsSummary = document.querySelector("#alertsSummary");
 const alertsTable = document.querySelector("#alertsTable");
 const addAlertButton = document.querySelector("#addAlertButton");
+const clearAlertsButton = document.querySelector("#clearAlertsButton");
 const datFileInput = document.querySelector("#datFileInput");
 const goldrushState = document.querySelector("#goldrushState");
 const hashBlake3 = document.querySelector("#hashBlake3");
@@ -65,6 +67,7 @@ const matchesTable = document.querySelector("#matchesTable");
 const matchSourceFilters = document.querySelector("#matchSourceFilters");
 const refreshAlertsButton = document.querySelector("#refreshAlertsButton");
 const refreshMatchesButton = document.querySelector("#refreshMatchesButton");
+const searchMatchesButton = document.querySelector("#searchMatchesButton");
 const sessionPanel = document.querySelector("#sessionPanel");
 const sessionUser = document.querySelector("#sessionUser");
 const tabButtons = [...document.querySelectorAll("[data-tab]")];
@@ -99,8 +102,16 @@ refreshAlertsButton.addEventListener("click", async () => {
   await loadAlerts();
 });
 
+clearAlertsButton.addEventListener("click", async () => {
+  await clearAlerts();
+});
+
 refreshMatchesButton.addEventListener("click", async () => {
   await loadMatches();
+});
+
+searchMatchesButton.addEventListener("click", async () => {
+  await searchMatches();
 });
 
 alertFilter.addEventListener("input", () => {
@@ -156,7 +167,7 @@ matchesPageNumberList.addEventListener("click", async (event) => {
 if (matchSourceFilters) {
   matchSourceFilters.addEventListener("click", async (event) => {
     const button = event.target?.closest?.("[data-source-key]");
-    if (!button || state.loadingMatches || state.loadingSources) {
+    if (!button || state.loadingMatches || state.loadingSources || state.clearingAlerts) {
       return;
     }
     const key = button.dataset.sourceKey || "";
@@ -371,6 +382,55 @@ async function importDat() {
   }
 }
 
+async function clearAlerts() {
+  if (!state.user || !canContribute()) {
+    setGoldrushState("Contributor role required", "warn");
+    return;
+  }
+  if (state.clearingAlerts) {
+    return;
+  }
+
+  const confirmed = window.confirm("Erase your Goldrush alerts? This cannot be undone.");
+  if (!confirmed) {
+    return;
+  }
+
+  state.clearingAlerts = true;
+  state.alertsRequestId += 1;
+  state.matchesRequestId += 1;
+  stopMatchesLoadingFeedback();
+  state.loadingAlerts = false;
+  state.loadingMatches = false;
+  state.loadingSources = false;
+  setGoldrushState("Erasing alerts", "quiet");
+  renderSession();
+  try {
+    const body = await fetchJson("/api/v1/goldrush/alerts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "clear" }),
+    }, "Erase alerts failed");
+    state.alerts = [];
+    state.matches = [];
+    state.alertsPage = 1;
+    state.matchesPage = 1;
+    state.alertsTotal = 0;
+    state.matchesTotal = 0;
+    state.sourceOptions = [];
+    state.selectedSourceKeys = [];
+    renderSourceFilters();
+    renderAlertsMessage("No alerts.");
+    renderMatchesMessage("No UFID hits.");
+    setGoldrushState(`${body.deleted || 0} alerts erased`, "ok");
+  } catch (error) {
+    setGoldrushState(error.message, "error");
+  } finally {
+    state.clearingAlerts = false;
+    renderSession();
+  }
+}
+
 async function loadAlertSources() {
   if (!state.user) {
     state.sourceOptions = [];
@@ -454,9 +514,8 @@ async function loadMatches() {
   const requestId = state.matchesRequestId + 1;
   state.matchesRequestId = requestId;
   state.loadingMatches = true;
-  state.matchesLoadingStartedAt = performance.now();
   renderSession();
-  startMatchesLoadingFeedback(requestId);
+  renderMatchesMessage("Loading stored matches.");
 
   const params = new URLSearchParams({
     limit: String(PAGE_LIMIT),
@@ -482,6 +541,50 @@ async function loadMatches() {
       return;
     }
     renderMatches();
+  } catch (error) {
+    if (requestId !== state.matchesRequestId) {
+      return;
+    }
+    renderMatchesMessage(error.message);
+    setGoldrushState(error.message, "error");
+  } finally {
+    if (requestId === state.matchesRequestId) {
+      state.loadingMatches = false;
+      renderSession();
+    }
+  }
+}
+
+async function searchMatches() {
+  if (!state.user) {
+    renderMatchesMessage("Log in to search Goldrush matches.");
+    setGoldrushState("Login required", "warn");
+    return;
+  }
+
+  const requestId = state.matchesRequestId + 1;
+  state.matchesRequestId = requestId;
+  state.loadingMatches = true;
+  state.matchesLoadingStartedAt = performance.now();
+  renderSession();
+  startMatchesLoadingFeedback(requestId);
+
+  try {
+    const body = await fetchJson("/api/v1/goldrush/matches/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }, "Search matches failed");
+    if (requestId !== state.matchesRequestId) {
+      return;
+    }
+    const created = Number(body.search?.created || 0);
+    const matched = Number(body.search?.matched || 0);
+    setGoldrushState(`${created} new hits stored (${matched} found)`, created ? "ok" : "quiet");
+    state.matchesPage = 1;
+    state.loadingMatches = false;
+    stopMatchesLoadingFeedback();
+    await loadMatches();
   } catch (error) {
     if (requestId !== state.matchesRequestId) {
       return;
@@ -630,7 +733,7 @@ function renderSourceFilters() {
     return;
   }
   const authenticated = Boolean(state.user);
-  const disabled = !authenticated || state.loadingMatches || state.loadingSources;
+  const disabled = !authenticated || state.loadingMatches || state.loadingSources || state.clearingAlerts;
   if (!authenticated) {
     matchSourceFilters.innerHTML = "";
     return;
@@ -704,28 +807,31 @@ function renderMatchesLoadingMessage() {
     ? (performance.now() - state.matchesLoadingStartedAt) / 1000
     : 0;
   const elapsed = elapsedSeconds >= 1 ? ` (${elapsedSeconds.toFixed(1)}s)` : "";
-  renderMatchesMessage(`Finding matches${elapsed}.`);
+  renderMatchesMessage(`Searching matches${elapsed}.`);
   const sourceSummary = selectedSourceSummary();
   matchesSummary.textContent = sourceSummary
     ? `Scanning ${sourceSummary} alert hashes against known files.`
     : "Scanning alert hashes against known files.";
-  setGoldrushState(`Finding matches${elapsed}`, "quiet");
+  setGoldrushState(`Searching matches${elapsed}`, "quiet");
 }
 
 function renderSession() {
   const authenticated = Boolean(state.user);
   const contributor = canContribute();
+  const alertBusy = state.loadingAlerts || state.clearingAlerts;
   loginForm.hidden = authenticated;
   sessionPanel.hidden = !authenticated;
-  alertFilter.disabled = !authenticated || state.loadingAlerts;
-  matchFilter.disabled = !authenticated || state.loadingMatches;
-  refreshAlertsButton.disabled = !authenticated || state.loadingAlerts;
-  refreshMatchesButton.disabled = !authenticated || state.loadingMatches;
+  alertFilter.disabled = !authenticated || alertBusy;
+  matchFilter.disabled = !authenticated || state.loadingMatches || state.clearingAlerts;
+  refreshAlertsButton.disabled = !authenticated || alertBusy;
+  clearAlertsButton.disabled = !authenticated || !contributor || state.clearingAlerts;
+  refreshMatchesButton.disabled = !authenticated || state.loadingMatches || state.clearingAlerts;
+  searchMatchesButton.disabled = !authenticated || state.loadingMatches || state.clearingAlerts;
   alertForm.querySelectorAll("input, textarea, button").forEach((control) => {
-    control.disabled = !authenticated || !contributor || state.loadingAlerts;
+    control.disabled = !authenticated || !contributor || alertBusy;
   });
   datFileInput.disabled = !authenticated || !contributor;
-  importDatButton.disabled = !authenticated || !contributor || state.loadingAlerts;
+  importDatButton.disabled = !authenticated || !contributor || alertBusy;
   if (authenticated) {
     const roles = (state.user.roles || []).join(", ");
     sessionUser.textContent = `${state.user.username}${roles ? ` (${roles})` : ""}`;
@@ -740,24 +846,26 @@ function renderSession() {
 function renderAlertPagination() {
   const pages = totalAlertPages();
   const authenticated = Boolean(state.user);
+  const disabled = state.loadingAlerts || state.clearingAlerts;
   alertsPageInfo.textContent = `Page ${Math.min(state.alertsPage, pages)} of ${pages}`;
   alertsSummary.textContent = paginationSummary(state.alertsPage, state.alerts.length, state.alertsTotal, "alerts");
-  alertsPreviousButton.disabled = !authenticated || state.loadingAlerts || state.alertsPage <= 1;
-  alertsNextButton.disabled = !authenticated || state.loadingAlerts || state.alertsPage >= pages;
+  alertsPreviousButton.disabled = !authenticated || disabled || state.alertsPage <= 1;
+  alertsNextButton.disabled = !authenticated || disabled || state.alertsPage >= pages;
   alertsPageNumberList.innerHTML = pageWindow(state.alertsPage, pages)
-    .map((item) => renderPageButton(item, state.alertsPage, authenticated, state.loadingAlerts))
+    .map((item) => renderPageButton(item, state.alertsPage, authenticated, disabled))
     .join("");
 }
 
 function renderMatchPagination() {
   const pages = totalMatchPages();
   const authenticated = Boolean(state.user);
+  const disabled = state.loadingMatches || state.clearingAlerts;
   matchesPageInfo.textContent = `Page ${Math.min(state.matchesPage, pages)} of ${pages}`;
   matchesSummary.textContent = paginationSummary(state.matchesPage, state.matches.length, state.matchesTotal, "matches");
-  matchesPreviousButton.disabled = !authenticated || state.loadingMatches || state.matchesPage <= 1;
-  matchesNextButton.disabled = !authenticated || state.loadingMatches || state.matchesPage >= pages;
+  matchesPreviousButton.disabled = !authenticated || disabled || state.matchesPage <= 1;
+  matchesNextButton.disabled = !authenticated || disabled || state.matchesPage >= pages;
   matchesPageNumberList.innerHTML = pageWindow(state.matchesPage, pages)
-    .map((item) => renderPageButton(item, state.matchesPage, authenticated, state.loadingMatches))
+    .map((item) => renderPageButton(item, state.matchesPage, authenticated, disabled))
     .join("");
 }
 
@@ -903,7 +1011,7 @@ async function fetchJson(url, options, failureMessage) {
       body = JSON.parse(text);
     } catch {
       if (!response.ok) {
-        throw new Error(`${failureMessage}: ${text}`);
+        throw new Error(`${failureMessage}: ${httpErrorSummary(response, text)}`);
       }
       throw new Error(`${failureMessage}: invalid JSON response`);
     }
@@ -915,6 +1023,17 @@ async function fetchJson(url, options, failureMessage) {
     throw new Error(detail || failureMessage || `HTTP ${response.status}`);
   }
   return body;
+}
+
+function httpErrorSummary(response, text) {
+  const status = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  const plainText = String(text || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return plainText ? `${status}: ${plainText.slice(0, 180)}` : status;
 }
 
 function formatBytes(value) {

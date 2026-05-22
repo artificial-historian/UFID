@@ -10,6 +10,7 @@ from threading import Lock
 from typing import Any, Iterable, Mapping, Sequence
 
 from ufid.auth import (
+    DEFAULT_REGISTRATION_TOKEN_SECONDS,
     DEFAULT_SESSION_SECONDS,
     AuthenticatedUser,
     hash_password,
@@ -64,6 +65,7 @@ IDENTITY_CONFLICT_TYPES = (
     "optional_hash_mismatch",
     "required_hash_overlap",
 )
+REMOVAL_REQUEST_STATUSES = ("pending", "approved", "blocked")
 ALLOWED_METADATA_TYPES = (
     "text",
     "image",
@@ -323,6 +325,8 @@ CREATE TABLE IF NOT EXISTS ufid_user_account (
     password_hash TEXT NOT NULL,
     display_name TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    activated_at TEXT,
+    registration_completed_at TEXT,
     disabled_at TEXT
 );
 
@@ -359,6 +363,87 @@ ON ufid_session (user_id);
 
 CREATE INDEX IF NOT EXISTS idx_ufid_session_expires_at
 ON ufid_session (expires_at);
+
+CREATE TABLE IF NOT EXISTS ufid_registration_token (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES ufid_user_account(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE CHECK (
+        length(token_hash) = 64 AND token_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    purpose TEXT NOT NULL CHECK (purpose IN ('registration_completion')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_by_user_id INTEGER REFERENCES ufid_user_account(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_registration_token_hash
+ON ufid_registration_token (token_hash);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_registration_token_user
+ON ufid_registration_token (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_registration_token_expires
+ON ufid_registration_token (expires_at);
+
+CREATE TABLE IF NOT EXISTS ufid_user_removal_request (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES ufid_user_account(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'blocked')),
+    requested_at TEXT NOT NULL,
+    decided_at TEXT,
+    decided_by_user_id INTEGER REFERENCES ufid_user_account(id) ON DELETE SET NULL,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_user_removal_request_user
+ON ufid_user_removal_request (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_user_removal_request_status
+ON ufid_user_removal_request (status);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ufid_user_removal_request_pending
+ON ufid_user_removal_request (user_id)
+WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS ufid_goldrush_user_alert (
+    user_id INTEGER NOT NULL REFERENCES ufid_user_account(id) ON DELETE CASCADE,
+    alert_id INTEGER NOT NULL REFERENCES ufid_goldrush_alert(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, alert_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_alert_alert
+ON ufid_goldrush_user_alert (alert_id);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_alert_created
+ON ufid_goldrush_user_alert (user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS ufid_goldrush_user_match (
+    user_id INTEGER NOT NULL,
+    alert_id INTEGER NOT NULL,
+    file_id INTEGER NOT NULL REFERENCES ufid_file(id) ON DELETE CASCADE,
+    matched_crc32 INTEGER NOT NULL CHECK (matched_crc32 IN (0, 1)),
+    matched_md5 INTEGER NOT NULL CHECK (matched_md5 IN (0, 1)),
+    matched_sha1 INTEGER NOT NULL CHECK (matched_sha1 IN (0, 1)),
+    matched_sha256 INTEGER NOT NULL CHECK (matched_sha256 IN (0, 1)),
+    matched_blake3 INTEGER NOT NULL CHECK (matched_blake3 IN (0, 1)),
+    size_matched INTEGER NOT NULL CHECK (size_matched IN (0, 1)),
+    found_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, alert_id, file_id),
+    FOREIGN KEY (user_id, alert_id)
+        REFERENCES ufid_goldrush_user_alert(user_id, alert_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_match_user
+ON ufid_goldrush_user_match (user_id, found_at);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_match_alert
+ON ufid_goldrush_user_match (alert_id);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_match_file
+ON ufid_goldrush_user_match (file_id);
 
 INSERT OR IGNORE INTO ufid_role (name) VALUES
     ('reader'),
@@ -420,7 +505,77 @@ def _initialize_once(connection: sqlite3.Connection, path: Path) -> None:
 def initialize(connection: sqlite3.Connection) -> None:
     _reject_legacy_schema(connection)
     connection.executescript(SQLITE_SCHEMA)
+    _migrate_auth_schema(connection)
+    _migrate_goldrush_alert_ownership(connection)
     connection.commit()
+
+
+def _migrate_auth_schema(connection: sqlite3.Connection) -> None:
+    user_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(ufid_user_account)").fetchall()
+    }
+    if "activated_at" not in user_columns:
+        connection.execute("ALTER TABLE ufid_user_account ADD COLUMN activated_at TEXT")
+    if "registration_completed_at" not in user_columns:
+        connection.execute(
+            "ALTER TABLE ufid_user_account ADD COLUMN registration_completed_at TEXT"
+        )
+    connection.execute(
+        """
+        UPDATE ufid_user_account
+        SET activated_at = COALESCE(activated_at, created_at),
+            registration_completed_at = COALESCE(registration_completed_at, created_at)
+        WHERE activated_at IS NULL
+           OR registration_completed_at IS NULL
+        """
+    )
+
+
+def _migrate_goldrush_alert_ownership(connection: sqlite3.Connection) -> None:
+    owner = connection.execute(
+        """
+        SELECT u.id
+        FROM ufid_user_account u
+        JOIN ufid_user_role ur ON ur.user_id = u.id
+        JOIN ufid_role r ON r.id = ur.role_id
+        WHERE r.name = 'admin'
+        ORDER BY u.id
+        LIMIT 1
+        """
+    ).fetchone()
+    if owner is None:
+        owner = connection.execute(
+            """
+            SELECT id
+            FROM ufid_user_account
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+    if owner is None:
+        return
+    _assign_unlinked_goldrush_alerts(connection, owner_user_id=int(owner["id"]))
+
+
+def _assign_unlinked_goldrush_alerts(
+    connection: sqlite3.Connection,
+    *,
+    owner_user_id: int,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO ufid_goldrush_user_alert (user_id, alert_id, created_at)
+        SELECT ?, a.id, a.created_at
+        FROM ufid_goldrush_alert a
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM ufid_goldrush_user_alert ua
+            WHERE ua.alert_id = a.id
+        )
+        """,
+        (owner_user_id,),
+    )
 
 
 def create_user(
@@ -430,23 +585,228 @@ def create_user(
     password: str,
     roles: Sequence[str] = ("reader",),
     display_name: str | None = None,
+    activate: bool = True,
+    registration_completed: bool = True,
 ) -> dict[str, Any]:
     normalized_username = _normalize_username(username)
     normalized_roles = _normalize_roles(roles)
     password_hash = hash_password(password)
+    now = utc_now_iso()
+    activated_at = now if activate else None
+    completed_at = now if registration_completed else None
+    had_users = (
+        connection.execute("SELECT 1 FROM ufid_user_account LIMIT 1").fetchone()
+        is not None
+    )
     with connection:
         cursor = connection.execute(
             """
-            INSERT INTO ufid_user_account (username, password_hash, display_name)
-            VALUES (?, ?, ?)
+            INSERT INTO ufid_user_account (
+                username,
+                password_hash,
+                display_name,
+                activated_at,
+                registration_completed_at
+            )
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (normalized_username, password_hash, display_name),
+            (
+                normalized_username,
+                password_hash,
+                display_name,
+                activated_at,
+                completed_at,
+            ),
         )
         user_id = int(cursor.lastrowid)
         _set_user_roles(connection, user_id=user_id, roles=normalized_roles)
-    user = get_user_by_username(connection, normalized_username)
+        if not had_users:
+            _assign_unlinked_goldrush_alerts(connection, owner_user_id=user_id)
+    user = get_user_by_id(connection, user_id)
     assert user is not None
     return user
+
+
+def register_user(
+    connection: sqlite3.Connection,
+    *,
+    username: str,
+    password: str,
+    display_name: str | None = None,
+) -> dict[str, Any]:
+    return create_user(
+        connection,
+        username=username,
+        password=password,
+        display_name=display_name,
+        roles=("reader",),
+        activate=False,
+        registration_completed=True,
+    )
+
+
+def create_invited_user(
+    connection: sqlite3.Connection,
+    *,
+    username: str,
+    roles: Sequence[str] = ("reader",),
+    display_name: str | None = None,
+    created_by_user_id: int | None = None,
+    token_seconds: int = DEFAULT_REGISTRATION_TOKEN_SECONDS,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    temporary_password = f"{new_session_token()}-{new_session_token()}"
+    with connection:
+        user = create_user(
+            connection,
+            username=username,
+            password=temporary_password,
+            display_name=display_name,
+            roles=roles,
+            activate=False,
+            registration_completed=False,
+        )
+        token, registration = create_registration_token(
+            connection,
+            user_id=int(user["id"]),
+            created_by_user_id=created_by_user_id,
+            seconds=token_seconds,
+        )
+    refreshed = get_user_by_id(connection, int(user["id"]))
+    assert refreshed is not None
+    return refreshed, token, registration
+
+
+def create_registration_token(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    created_by_user_id: int | None = None,
+    seconds: int = DEFAULT_REGISTRATION_TOKEN_SECONDS,
+) -> tuple[str, dict[str, Any]]:
+    if get_user_by_id(connection, user_id) is None:
+        raise ValueError("user does not exist")
+    token = new_session_token()
+    token_hash = hash_session_token(token)
+    now = utc_now_iso()
+    expires_at = session_expiry_iso(seconds)
+    with connection:
+        connection.execute(
+            """
+            UPDATE ufid_registration_token
+            SET used_at = ?
+            WHERE user_id = ?
+              AND purpose = 'registration_completion'
+              AND used_at IS NULL
+            """,
+            (now, user_id),
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO ufid_registration_token (
+                user_id,
+                token_hash,
+                purpose,
+                created_at,
+                expires_at,
+                created_by_user_id
+            )
+            VALUES (?, ?, 'registration_completion', ?, ?, ?)
+            """,
+            (user_id, token_hash, now, expires_at, created_by_user_id),
+        )
+        token_id = int(cursor.lastrowid)
+    registration = get_registration_token_by_id(connection, token_id)
+    assert registration is not None
+    return token, registration
+
+
+def get_registration_token_by_id(
+    connection: sqlite3.Connection,
+    token_id: int,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+            id,
+            user_id,
+            purpose,
+            created_at,
+            expires_at,
+            used_at,
+            created_by_user_id
+        FROM ufid_registration_token
+        WHERE id = ?
+        """,
+        (token_id,),
+    ).fetchone()
+    return None if row is None else dict(row)
+
+
+def get_registration_token(
+    connection: sqlite3.Connection,
+    token: str,
+) -> dict[str, Any] | None:
+    token_hash = hash_session_token(str(token or ""))
+    row = connection.execute(
+        """
+        SELECT
+            id,
+            user_id,
+            purpose,
+            created_at,
+            expires_at,
+            used_at,
+            created_by_user_id
+        FROM ufid_registration_token
+        WHERE token_hash = ?
+          AND purpose = 'registration_completion'
+        """,
+        (token_hash,),
+    ).fetchone()
+    if row is None or row["used_at"]:
+        return None
+    if parse_timestamp(row["expires_at"]) <= utc_now():
+        return None
+    result = dict(row)
+    result["user"] = get_user_by_id(connection, int(row["user_id"]))
+    return result
+
+
+def complete_registration(
+    connection: sqlite3.Connection,
+    *,
+    token: str,
+    password: str,
+    display_name: str | None = None,
+) -> dict[str, Any] | None:
+    registration = get_registration_token(connection, token)
+    if registration is None:
+        return None
+    user_id = int(registration["user_id"])
+    password_hash = hash_password(password)
+    now = utc_now_iso()
+    with connection:
+        connection.execute(
+            """
+            UPDATE ufid_user_account
+            SET password_hash = ?,
+                display_name = COALESCE(?, display_name),
+                activated_at = COALESCE(activated_at, ?),
+                registration_completed_at = ?,
+                disabled_at = NULL
+            WHERE id = ?
+            """,
+            (password_hash, display_name, now, now, user_id),
+        )
+        connection.execute(
+            """
+            UPDATE ufid_registration_token
+            SET used_at = ?
+            WHERE id = ?
+            """,
+            (now, int(registration["id"])),
+        )
+    return get_user_by_id(connection, user_id)
 
 
 def authenticate_user(
@@ -456,7 +816,9 @@ def authenticate_user(
     password: str,
 ) -> dict[str, Any] | None:
     user = get_user_by_username(connection, username)
-    if user is None or user.get("disabled_at"):
+    if user is None or user.get("disabled_at") or not user.get("activated_at"):
+        return None
+    if not user.get("registration_completed_at"):
         return None
     row = connection.execute(
         "SELECT password_hash FROM ufid_user_account WHERE id = ?",
@@ -505,6 +867,10 @@ def create_session(
         roles=user.roles,
         session_id=session_id,
         expires_at=expires_at,
+        created_at=user.created_at,
+        activated_at=user.activated_at,
+        registration_completed_at=user.registration_completed_at,
+        disabled_at=user.disabled_at,
     )
 
 
@@ -524,6 +890,9 @@ def get_authenticated_user(
             u.id AS user_id,
             u.username,
             u.display_name,
+            u.created_at,
+            u.activated_at,
+            u.registration_completed_at,
             u.disabled_at
         FROM ufid_session s
         JOIN ufid_user_account u ON u.id = s.user_id
@@ -532,6 +901,8 @@ def get_authenticated_user(
         (token_hash,),
     ).fetchone()
     if row is None or row["revoked_at"] or row["disabled_at"]:
+        return None
+    if not row["activated_at"] or not row["registration_completed_at"]:
         return None
     if parse_timestamp(row["expires_at"]) <= utc_now():
         return None
@@ -549,6 +920,14 @@ def get_authenticated_user(
         roles=tuple(get_user_roles(connection, int(row["user_id"]))),
         session_id=int(row["session_id"]),
         expires_at=str(row["expires_at"]),
+        created_at=str(row["created_at"]) if row["created_at"] else None,
+        activated_at=str(row["activated_at"]) if row["activated_at"] else None,
+        registration_completed_at=(
+            str(row["registration_completed_at"])
+            if row["registration_completed_at"]
+            else None
+        ),
+        disabled_at=str(row["disabled_at"]) if row["disabled_at"] else None,
     )
 
 
@@ -576,17 +955,354 @@ def get_user_by_username(
     normalized_username = _normalize_username(username)
     row = connection.execute(
         """
-        SELECT id, username, display_name, created_at, disabled_at
+        SELECT
+            id,
+            username,
+            display_name,
+            created_at,
+            activated_at,
+            registration_completed_at,
+            disabled_at
         FROM ufid_user_account
         WHERE lower(username) = lower(?)
         """,
         (normalized_username,),
     ).fetchone()
-    if row is None:
+    return _user_row(connection, row)
+
+
+def get_user_by_id(
+    connection: sqlite3.Connection,
+    user_id: int,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+            id,
+            username,
+            display_name,
+            created_at,
+            activated_at,
+            registration_completed_at,
+            disabled_at
+        FROM ufid_user_account
+        WHERE id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+    return _user_row(connection, row)
+
+
+def list_users(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            id,
+            username,
+            display_name,
+            created_at,
+            activated_at,
+            registration_completed_at,
+            disabled_at
+        FROM ufid_user_account
+        ORDER BY username
+        """
+    ).fetchall()
+    return [
+        user
+        for row in rows
+        if (user := _user_row(connection, row, include_removal=True)) is not None
+    ]
+
+
+def set_user_activation(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    active: bool,
+) -> dict[str, Any] | None:
+    if get_user_by_id(connection, user_id) is None:
         return None
-    user = dict(row)
-    user["roles"] = get_user_roles(connection, int(row["id"]))
-    return user
+    now = utc_now_iso()
+    with connection:
+        if active:
+            connection.execute(
+                """
+                UPDATE ufid_user_account
+                SET activated_at = COALESCE(activated_at, ?),
+                    disabled_at = NULL
+                WHERE id = ?
+                """,
+                (now, user_id),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE ufid_user_account
+                SET disabled_at = ?
+                WHERE id = ?
+                """,
+                (now, user_id),
+            )
+            revoke_user_sessions(connection, user_id=user_id)
+    return get_user_by_id(connection, user_id)
+
+
+def update_user_roles(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    roles: Sequence[str],
+) -> dict[str, Any] | None:
+    normalized_roles = _normalize_roles(roles)
+    if get_user_by_id(connection, user_id) is None:
+        return None
+    with connection:
+        connection.execute(
+            "DELETE FROM ufid_user_role WHERE user_id = ?",
+            (user_id,),
+        )
+        _set_user_roles(connection, user_id=user_id, roles=normalized_roles)
+    return get_user_by_id(connection, user_id)
+
+
+def delete_user(connection: sqlite3.Connection, user_id: int) -> bool:
+    with connection:
+        cursor = connection.execute(
+            "DELETE FROM ufid_user_account WHERE id = ?",
+            (user_id,),
+        )
+    return cursor.rowcount > 0
+
+
+def change_user_password(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    current_password: str,
+    new_password: str,
+    keep_token: str | None = None,
+) -> bool:
+    row = connection.execute(
+        "SELECT password_hash FROM ufid_user_account WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if not verify_password(current_password, str(row["password_hash"])):
+        return False
+    password_hash = hash_password(new_password)
+    with connection:
+        connection.execute(
+            "UPDATE ufid_user_account SET password_hash = ? WHERE id = ?",
+            (password_hash, user_id),
+        )
+        revoke_user_sessions(connection, user_id=user_id, keep_token=keep_token)
+    return True
+
+
+def revoke_user_sessions(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    keep_token: str | None = None,
+) -> int:
+    keep_hash = hash_session_token(keep_token) if keep_token else None
+    now = utc_now_iso()
+    if keep_hash:
+        cursor = connection.execute(
+            """
+            UPDATE ufid_session
+            SET revoked_at = ?
+            WHERE user_id = ?
+              AND revoked_at IS NULL
+              AND token_hash != ?
+            """,
+            (now, user_id, keep_hash),
+        )
+    else:
+        cursor = connection.execute(
+            """
+            UPDATE ufid_session
+            SET revoked_at = ?
+            WHERE user_id = ?
+              AND revoked_at IS NULL
+            """,
+            (now, user_id),
+        )
+    return max(cursor.rowcount, 0)
+
+
+def request_user_removal(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+) -> dict[str, Any]:
+    existing = get_user_removal_request(connection, user_id, status="pending")
+    if existing is not None:
+        return existing
+    now = utc_now_iso()
+    with connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO ufid_user_removal_request (user_id, status, requested_at)
+            VALUES (?, 'pending', ?)
+            """,
+            (user_id, now),
+        )
+        request_id = int(cursor.lastrowid)
+    request = get_user_removal_request_by_id(connection, request_id)
+    assert request is not None
+    return request
+
+
+def get_user_removal_request(
+    connection: sqlite3.Connection,
+    user_id: int,
+    *,
+    status: str | None = None,
+) -> dict[str, Any] | None:
+    status_filter = "AND status = ?" if status else ""
+    params: tuple[Any, ...] = (user_id, status) if status else (user_id,)
+    row = connection.execute(
+        f"""
+        SELECT
+            id,
+            user_id,
+            status,
+            requested_at,
+            decided_at,
+            decided_by_user_id,
+            notes
+        FROM ufid_user_removal_request
+        WHERE user_id = ?
+          {status_filter}
+        ORDER BY requested_at DESC, id DESC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    return _removal_request_row(connection, row)
+
+
+def get_user_removal_request_by_id(
+    connection: sqlite3.Connection,
+    request_id: int,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+            id,
+            user_id,
+            status,
+            requested_at,
+            decided_at,
+            decided_by_user_id,
+            notes
+        FROM ufid_user_removal_request
+        WHERE id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+    return _removal_request_row(connection, row)
+
+
+def list_user_removal_requests(
+    connection: sqlite3.Connection,
+    *,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    normalized_status = None
+    if status:
+        normalized_status = str(status).strip().lower()
+        if normalized_status not in REMOVAL_REQUEST_STATUSES:
+            allowed = ", ".join(REMOVAL_REQUEST_STATUSES)
+            raise ValueError(f"status must be one of: {allowed}")
+    where_sql = "WHERE status = ?" if normalized_status else ""
+    params: tuple[Any, ...] = (normalized_status,) if normalized_status else ()
+    rows = connection.execute(
+        f"""
+        SELECT
+            id,
+            user_id,
+            status,
+            requested_at,
+            decided_at,
+            decided_by_user_id,
+            notes
+        FROM ufid_user_removal_request
+        {where_sql}
+        ORDER BY requested_at DESC, id DESC
+        """,
+        params,
+    ).fetchall()
+    return [
+        request
+        for row in rows
+        if (request := _removal_request_row(connection, row)) is not None
+    ]
+
+
+def block_user_removal_request(
+    connection: sqlite3.Connection,
+    *,
+    request_id: int,
+    decided_by_user_id: int,
+    notes: str | None = None,
+) -> dict[str, Any] | None:
+    request = get_user_removal_request_by_id(connection, request_id)
+    if request is None or request["status"] != "pending":
+        return None
+    now = utc_now_iso()
+    with connection:
+        connection.execute(
+            """
+            UPDATE ufid_user_removal_request
+            SET status = 'blocked',
+                decided_at = ?,
+                decided_by_user_id = ?,
+                notes = ?
+            WHERE id = ?
+            """,
+            (now, decided_by_user_id, notes, request_id),
+        )
+    return get_user_removal_request_by_id(connection, request_id)
+
+
+def approve_user_removal_request(
+    connection: sqlite3.Connection,
+    *,
+    request_id: int,
+    decided_by_user_id: int,
+    notes: str | None = None,
+) -> dict[str, Any] | None:
+    request = get_user_removal_request_by_id(connection, request_id)
+    if request is None or request["status"] != "pending":
+        return None
+    now = utc_now_iso()
+    user_id = int(request["user_id"])
+    result = {
+        **request,
+        "status": "approved",
+        "decided_at": now,
+        "decided_by_user_id": decided_by_user_id,
+        "notes": notes,
+        "deleted_user_id": user_id,
+    }
+    with connection:
+        connection.execute(
+            """
+            UPDATE ufid_user_removal_request
+            SET status = 'approved',
+                decided_at = ?,
+                decided_by_user_id = ?,
+                notes = ?
+            WHERE id = ?
+            """,
+            (now, decided_by_user_id, notes, request_id),
+        )
+        connection.execute("DELETE FROM ufid_user_account WHERE id = ?", (user_id,))
+    return result
 
 
 def get_user_roles(connection: sqlite3.Connection, user_id: int) -> list[str]:
@@ -601,6 +1317,53 @@ def get_user_roles(connection: sqlite3.Connection, user_id: int) -> list[str]:
         (user_id,),
     ).fetchall()
     return [str(row["name"]) for row in rows]
+
+
+def _user_row(
+    connection: sqlite3.Connection,
+    row: Mapping[str, Any] | None,
+    *,
+    include_removal: bool = False,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    user = dict(row)
+    user["roles"] = get_user_roles(connection, int(row["id"]))
+    user["status"] = _user_status(user)
+    if include_removal:
+        user["removal_request"] = get_user_removal_request(
+            connection,
+            int(row["id"]),
+        )
+    return user
+
+
+def _user_status(user: Mapping[str, Any]) -> str:
+    if user.get("disabled_at"):
+        return "inactive"
+    if not user.get("registration_completed_at"):
+        return "invited"
+    if not user.get("activated_at"):
+        return "pending_activation"
+    return "active"
+
+
+def _removal_request_row(
+    connection: sqlite3.Connection,
+    row: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    request = dict(row)
+    request["user"] = get_user_by_id(connection, int(row["user_id"]))
+    if row["decided_by_user_id"] is not None:
+        request["decided_by"] = get_user_by_id(
+            connection,
+            int(row["decided_by_user_id"]),
+        )
+    else:
+        request["decided_by"] = None
+    return request
 
 
 def _reject_legacy_schema(connection: sqlite3.Connection) -> None:
@@ -968,6 +1731,7 @@ def add_file_metadata(
 def create_goldrush_alert(
     connection: sqlite3.Connection,
     *,
+    user_id: int,
     name: str,
     description: str,
     hashes: Mapping[str, str | None],
@@ -988,14 +1752,21 @@ def create_goldrush_alert(
         }
     )
     with connection:
-        created = _insert_goldrush_alert(connection, normalized)
-    alert = _get_goldrush_alert_by_fingerprint(connection, normalized["fingerprint"])
-    assert alert is not None
+        _insert_goldrush_alert(connection, normalized)
+        alert = _get_goldrush_alert_by_fingerprint(connection, normalized["fingerprint"])
+        assert alert is not None
+        created = _insert_goldrush_user_alert(
+            connection,
+            user_id=user_id,
+            alert_id=int(alert["id"]),
+        )
     return {"alert": alert, "created": created}
 
 
 def import_goldrush_alerts(
     connection: sqlite3.Connection,
+    *,
+    user_id: int,
     alerts: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     received = list(alerts)
@@ -1016,7 +1787,14 @@ def import_goldrush_alerts(
     created = 0
     with connection:
         for row in normalized_rows:
-            if _insert_goldrush_alert(connection, row):
+            _insert_goldrush_alert(connection, row)
+            alert = _get_goldrush_alert_by_fingerprint(connection, row["fingerprint"])
+            assert alert is not None
+            if _insert_goldrush_user_alert(
+                connection,
+                user_id=user_id,
+                alert_id=int(alert["id"]),
+            ):
                 created += 1
 
     return {
@@ -1028,9 +1806,33 @@ def import_goldrush_alerts(
     }
 
 
+def clear_goldrush_alerts(connection: sqlite3.Connection, *, user_id: int) -> int:
+    with connection:
+        cursor = connection.execute(
+            "DELETE FROM ufid_goldrush_user_alert WHERE user_id = ?",
+            (user_id,),
+        )
+        connection.execute(
+            "DELETE FROM ufid_goldrush_user_match WHERE user_id = ?",
+            (user_id,),
+        )
+        connection.execute(
+            """
+            DELETE FROM ufid_goldrush_alert
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM ufid_goldrush_user_alert ua
+                WHERE ua.alert_id = ufid_goldrush_alert.id
+            )
+            """
+        )
+    return max(int(cursor.rowcount if cursor.rowcount is not None else 0), 0)
+
+
 def list_goldrush_alerts(
     connection: sqlite3.Connection,
     *,
+    user_id: int,
     limit: int = 200,
     offset: int = 0,
     query: str | None = None,
@@ -1040,13 +1842,15 @@ def list_goldrush_alerts(
     where_sql, params = _goldrush_alert_filter(query)
     rows = connection.execute(
         f"""
-        SELECT *
-        FROM ufid_goldrush_alert a
+        SELECT a.*
+        FROM ufid_goldrush_user_alert ua
+        JOIN ufid_goldrush_alert a ON a.id = ua.alert_id
+        WHERE ua.user_id = ?
         {where_sql}
-        ORDER BY a.id DESC
+        ORDER BY ua.created_at DESC, a.id DESC
         LIMIT ? OFFSET ?
         """,
-        (*params, bounded_limit, bounded_offset),
+        (user_id, *params, bounded_limit, bounded_offset),
     ).fetchall()
     return [_goldrush_alert_row(row) for row in rows]
 
@@ -1054,21 +1858,28 @@ def list_goldrush_alerts(
 def count_goldrush_alerts(
     connection: sqlite3.Connection,
     *,
+    user_id: int,
     query: str | None = None,
 ) -> int:
     where_sql, params = _goldrush_alert_filter(query)
     row = connection.execute(
         f"""
         SELECT COUNT(*) AS total
-        FROM ufid_goldrush_alert a
+        FROM ufid_goldrush_user_alert ua
+        JOIN ufid_goldrush_alert a ON a.id = ua.alert_id
+        WHERE ua.user_id = ?
         {where_sql}
         """,
-        params,
+        (user_id, *params),
     ).fetchone()
     return int(row["total"] if row is not None else 0)
 
 
-def list_goldrush_alert_sources(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+def list_goldrush_alert_sources(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+) -> list[dict[str, Any]]:
     rows = connection.execute(
         f"""
         WITH goldrush_alert_source AS (
@@ -1083,6 +1894,8 @@ def list_goldrush_alert_sources(connection: sqlite3.Connection) -> list[dict[str
                 NULLIF(a.source_type, '') AS source_type,
                 NULLIF(a.source_name, '') AS source_name
             FROM ufid_goldrush_alert a
+            JOIN ufid_goldrush_user_alert ua ON ua.alert_id = a.id
+            WHERE ua.user_id = ?
         )
         SELECT
             source_key,
@@ -1096,14 +1909,100 @@ def list_goldrush_alert_sources(connection: sqlite3.Connection) -> list[dict[str
             CASE WHEN source_key = 'manual' THEN 0 ELSE 1 END,
             lower(label),
             source_key
-        """
+        """,
+        (user_id,),
     ).fetchall()
     return [_goldrush_alert_source_row(row) for row in rows]
+
+
+def scan_goldrush_matches(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+) -> dict[str, int]:
+    rows = connection.execute(
+        f"""
+        {_goldrush_match_cte_sql()}
+        SELECT
+            m.alert_id,
+            m.file_id,
+            m.matched_crc32,
+            m.matched_md5,
+            m.matched_sha1,
+            m.matched_sha256,
+            m.matched_blake3,
+            CASE WHEN a.size_bytes IS NOT NULL THEN 1 ELSE 0 END AS size_matched
+        FROM goldrush_match m
+        JOIN ufid_goldrush_alert a ON a.id = m.alert_id
+        ORDER BY a.id DESC, m.file_id DESC
+        """,
+        (user_id,),
+    ).fetchall()
+    created = 0
+    with connection:
+        for row in rows:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO ufid_goldrush_user_match (
+                    user_id,
+                    alert_id,
+                    file_id,
+                    matched_crc32,
+                    matched_md5,
+                    matched_sha1,
+                    matched_sha256,
+                    matched_blake3,
+                    size_matched
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    int(row["alert_id"]),
+                    int(row["file_id"]),
+                    int(row["matched_crc32"]),
+                    int(row["matched_md5"]),
+                    int(row["matched_sha1"]),
+                    int(row["matched_sha256"]),
+                    int(row["matched_blake3"]),
+                    int(row["size_matched"]),
+                ),
+            )
+            if cursor.rowcount > 0:
+                created += 1
+            else:
+                connection.execute(
+                    """
+                    UPDATE ufid_goldrush_user_match
+                    SET matched_crc32 = ?,
+                        matched_md5 = ?,
+                        matched_sha1 = ?,
+                        matched_sha256 = ?,
+                        matched_blake3 = ?,
+                        size_matched = ?
+                    WHERE user_id = ?
+                      AND alert_id = ?
+                      AND file_id = ?
+                    """,
+                    (
+                        int(row["matched_crc32"]),
+                        int(row["matched_md5"]),
+                        int(row["matched_sha1"]),
+                        int(row["matched_sha256"]),
+                        int(row["matched_blake3"]),
+                        int(row["size_matched"]),
+                        user_id,
+                        int(row["alert_id"]),
+                        int(row["file_id"]),
+                    ),
+                )
+    return {"matched": len(rows), "created": created}
 
 
 def list_goldrush_matches(
     connection: sqlite3.Connection,
     *,
+    user_id: int,
     limit: int = 200,
     offset: int = 0,
     query: str | None = None,
@@ -1114,7 +2013,7 @@ def list_goldrush_matches(
     filter_sql, params = _goldrush_match_filter(query, source_keys=source_keys)
     rows = connection.execute(
         f"""
-        {_goldrush_match_cte_sql(include_sources=True)}
+        {_stored_goldrush_match_cte_sql(include_sources=True)}
         SELECT
             a.id AS alert_id,
             a.name AS alert_name,
@@ -1157,7 +2056,8 @@ def list_goldrush_matches(
             m.matched_sha1,
             m.matched_sha256,
             m.matched_blake3,
-            CASE WHEN a.size_bytes IS NOT NULL THEN 1 ELSE 0 END AS size_matched,
+            m.size_matched,
+            m.found_at AS match_found_at,
             s.source_file_id,
             s.ia_identifier,
             s.ia_item_url,
@@ -1165,10 +2065,10 @@ def list_goldrush_matches(
             s.ia_file_name
         {_goldrush_match_from_sql(include_sources=True)}
         {filter_sql}
-        ORDER BY a.id DESC, f.id DESC
+        ORDER BY m.found_at DESC, a.id DESC, f.id DESC
         LIMIT ? OFFSET ?
         """,
-        (*params, bounded_limit, bounded_offset),
+        (user_id, *params, bounded_limit, bounded_offset),
     ).fetchall()
     return [_goldrush_match_row(row) for row in rows]
 
@@ -1176,18 +2076,19 @@ def list_goldrush_matches(
 def count_goldrush_matches(
     connection: sqlite3.Connection,
     *,
+    user_id: int,
     query: str | None = None,
     source_keys: Sequence[str] | None = None,
 ) -> int:
     filter_sql, params = _goldrush_match_filter(query, source_keys=source_keys)
     row = connection.execute(
         f"""
-        {_goldrush_match_cte_sql()}
+        {_stored_goldrush_match_cte_sql()}
         SELECT COUNT(*) AS total
         {_goldrush_match_from_sql()}
         {filter_sql}
         """,
-        params,
+        (user_id, *params),
     ).fetchone()
     return int(row["total"] if row is not None else 0)
 
@@ -1625,6 +2526,22 @@ def _insert_goldrush_alert(
     return cursor.rowcount > 0
 
 
+def _insert_goldrush_user_alert(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    alert_id: int,
+) -> bool:
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO ufid_goldrush_user_alert (user_id, alert_id)
+        VALUES (?, ?)
+        """,
+        (user_id, alert_id),
+    )
+    return cursor.rowcount > 0
+
+
 def _get_goldrush_alert_by_fingerprint(
     connection: sqlite3.Connection,
     fingerprint: str,
@@ -1697,6 +2614,7 @@ def _goldrush_match_row(row: Mapping[str, Any]) -> dict[str, Any]:
         },
         "matched_algorithms": matched_algorithms,
         "size_matched": bool(values["size_matched"]),
+        "found_at": values.get("match_found_at"),
     }
 
 
@@ -1722,25 +2640,27 @@ def _goldrush_alert_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
     like = f"%{query}%"
     return (
         """
-        WHERE CAST(a.id AS TEXT) LIKE ?
-           OR CAST(a.size_bytes AS TEXT) LIKE ?
-           OR a.name LIKE ?
-           OR a.description LIKE ?
-           OR a.crc32 LIKE ?
-           OR a.md5 LIKE ?
-           OR a.sha1 LIKE ?
-           OR a.sha256 LIKE ?
-           OR a.blake3 LIKE ?
-           OR a.source_type LIKE ?
-           OR a.source_name LIKE ?
-           OR a.source_detail LIKE ?
+          AND (
+               CAST(a.id AS TEXT) LIKE ?
+            OR CAST(a.size_bytes AS TEXT) LIKE ?
+            OR a.name LIKE ?
+            OR a.description LIKE ?
+            OR a.crc32 LIKE ?
+            OR a.md5 LIKE ?
+            OR a.sha1 LIKE ?
+            OR a.sha256 LIKE ?
+            OR a.blake3 LIKE ?
+            OR a.source_type LIKE ?
+            OR a.source_name LIKE ?
+            OR a.source_detail LIKE ?
+          )
         """,
         (like, like, like, like, like, like, like, like, like, like, like, like),
     )
 
 
-def _goldrush_match_cte_sql(*, include_sources: bool = False) -> str:
-    source_ctes = (
+def _goldrush_match_source_ctes_sql(*, include_sources: bool = False) -> str:
+    return (
         """
         ,
         goldrush_match_ancestor(file_id, ancestor_file_id, depth) AS (
@@ -1825,10 +2745,24 @@ def _goldrush_match_cte_sql(*, include_sources: bool = False) -> str:
         if include_sources
         else ""
     )
+
+
+def _goldrush_match_cte_sql(
+    *,
+    include_sources: bool = False,
+    user_placeholder: str = "?",
+) -> str:
+    source_ctes = _goldrush_match_source_ctes_sql(include_sources=include_sources)
     return f"""
-        WITH RECURSIVE goldrush_match_pair AS (
-            SELECT a.id AS alert_id, f.id AS file_id, 'crc32' AS algorithm
+        WITH RECURSIVE scoped_goldrush_alert AS (
+            SELECT a.*
             FROM ufid_goldrush_alert a
+            JOIN ufid_goldrush_user_alert ua ON ua.alert_id = a.id
+            WHERE ua.user_id = {user_placeholder}
+        ),
+        goldrush_match_pair AS (
+            SELECT a.id AS alert_id, f.id AS file_id, 'crc32' AS algorithm
+            FROM scoped_goldrush_alert a
             JOIN ufid_file f ON f.crc32 = a.crc32
             WHERE a.crc32 IS NOT NULL
               AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
@@ -1836,7 +2770,7 @@ def _goldrush_match_cte_sql(*, include_sources: bool = False) -> str:
             UNION ALL
 
             SELECT a.id AS alert_id, f.id AS file_id, 'md5' AS algorithm
-            FROM ufid_goldrush_alert a
+            FROM scoped_goldrush_alert a
             JOIN ufid_file f ON f.md5 = a.md5
             WHERE a.md5 IS NOT NULL
               AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
@@ -1844,7 +2778,7 @@ def _goldrush_match_cte_sql(*, include_sources: bool = False) -> str:
             UNION ALL
 
             SELECT a.id AS alert_id, f.id AS file_id, 'sha1' AS algorithm
-            FROM ufid_goldrush_alert a
+            FROM scoped_goldrush_alert a
             JOIN ufid_file f ON f.sha1 = a.sha1
             WHERE a.sha1 IS NOT NULL
               AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
@@ -1852,7 +2786,7 @@ def _goldrush_match_cte_sql(*, include_sources: bool = False) -> str:
             UNION ALL
 
             SELECT a.id AS alert_id, f.id AS file_id, 'sha256' AS algorithm
-            FROM ufid_goldrush_alert a
+            FROM scoped_goldrush_alert a
             JOIN ufid_file f ON f.sha256 = a.sha256
             WHERE a.sha256 IS NOT NULL
               AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
@@ -1860,7 +2794,7 @@ def _goldrush_match_cte_sql(*, include_sources: bool = False) -> str:
             UNION ALL
 
             SELECT a.id AS alert_id, f.id AS file_id, 'blake3' AS algorithm
-            FROM ufid_goldrush_alert a
+            FROM scoped_goldrush_alert a
             JOIN ufid_file f ON f.blake3 = a.blake3
             WHERE a.blake3 IS NOT NULL
               AND (a.size_bytes IS NULL OR a.size_bytes = f.size_bytes)
@@ -1878,6 +2812,31 @@ def _goldrush_match_cte_sql(*, include_sources: bool = False) -> str:
             GROUP BY alert_id, file_id
         )
         {source_ctes}
+    """
+
+
+def _stored_goldrush_match_cte_sql(
+    *,
+    include_sources: bool = False,
+    user_placeholder: str = "?",
+) -> str:
+    return f"""
+        WITH RECURSIVE goldrush_match AS (
+            SELECT
+                user_id,
+                alert_id,
+                file_id,
+                matched_crc32,
+                matched_md5,
+                matched_sha1,
+                matched_sha256,
+                matched_blake3,
+                size_matched,
+                found_at
+            FROM ufid_goldrush_user_match
+            WHERE user_id = {user_placeholder}
+        )
+        {_goldrush_match_source_ctes_sql(include_sources=include_sources)}
     """
 
 

@@ -55,6 +55,19 @@ DEFAULT_COLLECTION = "vintagesoftware"
 INGEST_MODES = ("all", "metadata", "download")
 DEFAULT_SCRAPE_FIELDS = ["identifier", "title", "mediatype", "collection"]
 REQUIRED_IA_IDENTITY_FIELDS = ("size", "crc32", "md5", "sha1")
+IA_METADATA_PREFIX = "org.archive-"
+IA_ITEM_CONTAINER_FIELDS = {"metadata", "files"}
+PROMOTED_IA_FILE_FIELDS = {
+    "name",
+    "source",
+    "format",
+    "size",
+    "mtime",
+    "md5",
+    "sha1",
+    "crc32",
+    "url",
+}
 UNSUPPORTED_CONTAINER_SUFFIXES = (
     ".iso",
     ".isz",
@@ -132,6 +145,7 @@ class IngestOptions:
     max_size_bytes: int | None
     original_only: bool
     skip_metadata_files: bool
+    ia_artifacts: bool
     keep_cache: bool
     retry_failed: bool
     dry_run: bool
@@ -153,6 +167,7 @@ class UFIDTarget(ABC):
         *,
         identifier: str,
         ia_file: IAFile,
+        item_metadata: Mapping[str, Any] | None,
         hashes: Mapping[str, str],
         size_bytes: int,
     ) -> tuple[int, bool, bool]:
@@ -164,6 +179,7 @@ class UFIDTarget(ABC):
         *,
         identifier: str,
         ia_file: IAFile,
+        item_metadata: Mapping[str, Any] | None,
         local_path: Path,
         hashes: Mapping[str, str],
         size_bytes: int,
@@ -201,6 +217,7 @@ class LocalUFIDTarget(UFIDTarget):
         *,
         identifier: str,
         ia_file: IAFile,
+        item_metadata: Mapping[str, Any] | None,
         hashes: Mapping[str, str],
         size_bytes: int,
     ) -> tuple[int, bool, bool]:
@@ -211,7 +228,7 @@ class LocalUFIDTarget(UFIDTarget):
             hashes=hashes,
             description=f"Internet Archive file {identifier}/{ia_file.name}",
             content_type=mimetypes.guess_type(ia_file.name)[0],
-            metadata=ia_metadata(identifier, ia_file),
+            metadata=ia_metadata(identifier, ia_file, item_metadata=item_metadata),
         )
         return result.file_id, result.created, result.enriched
 
@@ -220,6 +237,7 @@ class LocalUFIDTarget(UFIDTarget):
         *,
         identifier: str,
         ia_file: IAFile,
+        item_metadata: Mapping[str, Any] | None,
         local_path: Path,
         hashes: Mapping[str, str],
         size_bytes: int,
@@ -231,7 +249,7 @@ class LocalUFIDTarget(UFIDTarget):
             hashes=hashes,
             description=f"Internet Archive file {identifier}/{ia_file.name}",
             content_type=mimetypes.guess_type(ia_file.name)[0],
-            metadata=ia_metadata(identifier, ia_file),
+            metadata=ia_metadata(identifier, ia_file, item_metadata=item_metadata),
         )
         return result.file_id, result.created, result.enriched
 
@@ -270,6 +288,7 @@ class BackendUFIDTarget(UFIDTarget):
         *,
         identifier: str,
         ia_file: IAFile,
+        item_metadata: Mapping[str, Any] | None,
         hashes: Mapping[str, str],
         size_bytes: int,
     ) -> tuple[int, bool, bool]:
@@ -281,7 +300,11 @@ class BackendUFIDTarget(UFIDTarget):
                 "description": f"Internet Archive file {identifier}/{ia_file.name}",
                 "content_type": mimetypes.guess_type(ia_file.name)[0],
                 "hashes": dict(hashes),
-                "metadata": ia_metadata(identifier, ia_file),
+                "metadata": ia_metadata(
+                    identifier,
+                    ia_file,
+                    item_metadata=item_metadata,
+                ),
             },
             api_token=self.api_token,
         )
@@ -292,6 +315,7 @@ class BackendUFIDTarget(UFIDTarget):
         *,
         identifier: str,
         ia_file: IAFile,
+        item_metadata: Mapping[str, Any] | None,
         local_path: Path,
         hashes: Mapping[str, str],
         size_bytes: int,
@@ -304,7 +328,11 @@ class BackendUFIDTarget(UFIDTarget):
                 "description": f"Internet Archive file {identifier}/{ia_file.name}",
                 "content_type": mimetypes.guess_type(ia_file.name)[0],
                 "hashes": dict(hashes),
-                "metadata": ia_metadata(identifier, ia_file),
+                "metadata": ia_metadata(
+                    identifier,
+                    ia_file,
+                    item_metadata=item_metadata,
+                ),
             },
             api_token=self.api_token,
         )
@@ -833,15 +861,28 @@ class IAIngestRunner:
 
         download_identity_required = 0
         api_identity_available = 0
+        queued_files = 0
+        skipped_ia_artifacts = 0
         item_ufid_created = 0
         item_ufid_enriched = 0
         item_ufid_failed = 0
         for ia_file in item.files:
+            artifact_skip_reason = self._ia_artifact_skip_reason(ia_file)
+            if artifact_skip_reason:
+                self.stats.skipped_files += 1
+                skipped_ia_artifacts += 1
+                self._progress(
+                    "info",
+                    "file_skipped",
+                    f"Skipped IA file {identifier}/{ia_file.name}: {artifact_skip_reason}",
+                )
+                continue
             missing_identity = missing_required_ia_identity(ia_file)
             if missing_identity:
                 download_identity_required += 1
             else:
                 api_identity_available += 1
+            queued_files += 1
             self.state.upsert_file(
                 item_identifier=identifier,
                 ia_file=ia_file,
@@ -865,6 +906,7 @@ class IAIngestRunner:
                 file_id, created, enriched = self.target.upsert_declared_file(
                     identifier=identifier,
                     ia_file=ia_file,
+                    item_metadata=item.raw,
                     hashes=declared_identity_hashes(ia_file),
                     size_bytes=int(ia_file.size),
                 )
@@ -924,9 +966,10 @@ class IAIngestRunner:
         self._progress(
             "info",
             "metadata_done",
-            f"Queued {len(item.files)} IA file(s) from metadata: {identifier}",
+            f"Queued {queued_files} IA file(s) from metadata: {identifier}",
             api_identity_available=api_identity_available,
             download_identity_required=download_identity_required,
+            skipped_ia_artifacts=skipped_ia_artifacts,
             ufid_created=item_ufid_created,
             ufid_enriched=item_ufid_enriched,
             ufid_failed=item_ufid_failed,
@@ -986,6 +1029,7 @@ class IAIngestRunner:
             file_id, created, enriched = self.target.upsert_downloaded_file(
                 identifier=identifier,
                 ia_file=ia_file,
+                item_metadata=self.state.get_item_metadata(identifier),
                 local_path=download.path,
                 hashes=hash_result.hashes,
                 size_bytes=hash_result.size_bytes,
@@ -1064,9 +1108,9 @@ class IAIngestRunner:
         reason = None
         if self.options.original_only and ia_file.source != "original":
             reason = "not original"
-        elif self.options.skip_metadata_files and is_metadata_file(ia_file):
-            reason = "metadata file skipped"
-        elif (
+        else:
+            reason = self._ia_artifact_skip_reason(ia_file)
+        if reason is None and (
             self.options.max_file_bytes is not None
             and ia_file.size is not None
             and ia_file.size > self.options.max_file_bytes
@@ -1088,6 +1132,13 @@ class IAIngestRunner:
             )
             return True
         return False
+
+    def _ia_artifact_skip_reason(self, ia_file: IAFile) -> str | None:
+        if self.options.ia_artifacts and not self.options.skip_metadata_files:
+            return None
+        if is_metadata_file(ia_file):
+            return "IA artifact file skipped"
+        return None
 
     def _should_defer_download(
         self,
@@ -1276,13 +1327,26 @@ class IAIngestRunner:
         return line
 
 
-def ia_metadata(identifier: str, ia_file: IAFile) -> list[dict[str, str]]:
+def ia_metadata(
+    identifier: str,
+    ia_file: IAFile,
+    *,
+    item_metadata: Mapping[str, Any] | None = None,
+) -> list[dict[str, str]]:
     metadata = [
         {"metadata_type": "text", "name": "source", "value": "internet_archive"},
         {"metadata_type": "text", "name": "ia_identifier", "value": identifier},
         {"metadata_type": "text", "name": "ia_file_name", "value": ia_file.name},
-        {"metadata_type": "url", "name": "ia_item_url", "value": f"https://archive.org/details/{identifier}"},
-        {"metadata_type": "url", "name": "ia_file_url", "value": file_url(identifier, ia_file.name)},
+        {
+            "metadata_type": "url",
+            "name": "ia_item_url",
+            "value": f"https://archive.org/details/{identifier}",
+        },
+        {
+            "metadata_type": "url",
+            "name": "ia_file_url",
+            "value": file_url(identifier, ia_file.name),
+        },
     ]
     optional_values = {
         "ia_file_source": ia_file.source,
@@ -1296,10 +1360,119 @@ def ia_metadata(identifier: str, ia_file: IAFile) -> list[dict[str, str]]:
     for name, value in optional_values.items():
         if value:
             metadata.append({"metadata_type": "text", "name": name, "value": value})
+    metadata.extend(_unpromoted_ia_metadata(item_metadata, ia_file))
     return metadata
 
 
+def _unpromoted_ia_metadata(
+    item_metadata: Mapping[str, Any] | None,
+    ia_file: IAFile,
+) -> list[dict[str, str]]:
+    metadata: list[dict[str, str]] = []
+    if item_metadata:
+        for key, value in sorted(item_metadata.items()):
+            if key in IA_ITEM_CONTAINER_FIELDS:
+                continue
+            metadata.extend(
+                _namespaced_ia_metadata_rows(
+                    str(key),
+                    value,
+                    notes="Internet Archive item record field",
+                )
+            )
+
+        item_fields = item_metadata.get("metadata")
+        if isinstance(item_fields, Mapping):
+            for key, value in sorted(item_fields.items()):
+                metadata.extend(
+                    _namespaced_ia_metadata_rows(
+                        str(key),
+                        value,
+                        notes="Internet Archive item metadata field",
+                    )
+                )
+
+    for key, value in sorted(ia_file.raw.items()):
+        if key in PROMOTED_IA_FILE_FIELDS:
+            continue
+        metadata.extend(
+            _namespaced_ia_metadata_rows(
+                str(key),
+                value,
+                notes="Internet Archive file metadata field",
+            )
+        )
+    return metadata
+
+
+def _namespaced_ia_metadata_rows(
+    name: str,
+    value: Any,
+    *,
+    notes: str,
+) -> list[dict[str, str]]:
+    normalized_name = f"{IA_METADATA_PREFIX}{name}"
+    if isinstance(value, list):
+        if not value:
+            return [
+                _namespaced_ia_metadata_row(
+                    normalized_name,
+                    value,
+                    notes=notes,
+                )
+            ]
+        if all(not isinstance(item, (Mapping, list)) for item in value):
+            return [
+                _namespaced_ia_metadata_row(
+                    normalized_name,
+                    item,
+                    notes=notes,
+                )
+                for item in value
+            ]
+    return [
+        _namespaced_ia_metadata_row(
+            normalized_name,
+            value,
+            notes=notes,
+        )
+    ]
+
+
+def _namespaced_ia_metadata_row(
+    name: str,
+    value: Any,
+    *,
+    notes: str,
+) -> dict[str, str]:
+    metadata_type, serialized_value = _serialize_ia_metadata_value(value)
+    return {
+        "metadata_type": metadata_type,
+        "name": name,
+        "value": serialized_value,
+        "notes": notes,
+    }
+
+
+def _serialize_ia_metadata_value(value: Any) -> tuple[str, str]:
+    if isinstance(value, (Mapping, list, bool)) or value is None:
+        return "json", json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if isinstance(value, (int, float)):
+        return "number", str(value)
+    return "text", str(value)
+
+
 def queued_file_to_ia_file(queued_file: QueuedFile) -> IAFile:
+    raw = queued_file.raw or {
+        "name": queued_file.name,
+        "source": queued_file.source,
+        "format": queued_file.format,
+        "size": queued_file.size_bytes,
+        "md5": queued_file.md5,
+        "sha1": queued_file.sha1,
+        "crc32": queued_file.crc32,
+        "url": queued_file.url,
+    }
     return IAFile(
         name=queued_file.name,
         source=queued_file.source,
@@ -1308,16 +1481,7 @@ def queued_file_to_ia_file(queued_file: QueuedFile) -> IAFile:
         md5=queued_file.md5,
         sha1=queued_file.sha1,
         crc32=queued_file.crc32,
-        raw={
-            "name": queued_file.name,
-            "source": queued_file.source,
-            "format": queued_file.format,
-            "size": queued_file.size_bytes,
-            "md5": queued_file.md5,
-            "sha1": queued_file.sha1,
-            "crc32": queued_file.crc32,
-            "url": queued_file.url,
-        },
+        raw=dict(raw),
     )
 
 
@@ -1462,7 +1626,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--original-only", action="store_true")
-    parser.add_argument("--skip-metadata-files", action="store_true")
+    parser.add_argument(
+        "--ia-artifacts",
+        action="store_true",
+        help=(
+            "Include Internet Archive-generated artifact files such as "
+            "*_files.xml, *_meta.sqlite, and *_meta.xml. These are skipped by "
+            "default."
+        ),
+    )
+    parser.add_argument(
+        "--skip-metadata-files",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--keep-cache", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -1551,6 +1728,7 @@ def options_from_args(args: argparse.Namespace) -> IngestOptions:
         max_size_bytes=args.max_size_bytes,
         original_only=bool(args.original_only),
         skip_metadata_files=bool(args.skip_metadata_files),
+        ia_artifacts=bool(args.ia_artifacts),
         keep_cache=bool(args.keep_cache),
         retry_failed=bool(args.retry_failed),
         dry_run=bool(args.dry_run),

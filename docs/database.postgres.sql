@@ -199,6 +199,8 @@ CREATE TABLE IF NOT EXISTS ufid_user_account (
     password_hash TEXT NOT NULL,
     display_name TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    activated_at TIMESTAMPTZ,
+    registration_completed_at TIMESTAMPTZ,
     disabled_at TIMESTAMPTZ
 );
 
@@ -228,6 +230,85 @@ CREATE TABLE IF NOT EXISTS ufid_session (
 CREATE INDEX IF NOT EXISTS idx_ufid_session_token_hash ON ufid_session (token_hash);
 CREATE INDEX IF NOT EXISTS idx_ufid_session_user_id ON ufid_session (user_id);
 CREATE INDEX IF NOT EXISTS idx_ufid_session_expires_at ON ufid_session (expires_at);
+
+CREATE TABLE IF NOT EXISTS ufid_registration_token (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES ufid_user_account(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    purpose TEXT NOT NULL CHECK (purpose IN ('registration_completion')),
+    created_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    created_by_user_id BIGINT REFERENCES ufid_user_account(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_registration_token_hash
+    ON ufid_registration_token (token_hash);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_registration_token_user
+    ON ufid_registration_token (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_registration_token_expires
+    ON ufid_registration_token (expires_at);
+
+CREATE TABLE IF NOT EXISTS ufid_user_removal_request (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES ufid_user_account(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'blocked')),
+    requested_at TIMESTAMPTZ NOT NULL,
+    decided_at TIMESTAMPTZ,
+    decided_by_user_id BIGINT REFERENCES ufid_user_account(id) ON DELETE SET NULL,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_user_removal_request_user
+    ON ufid_user_removal_request (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_user_removal_request_status
+    ON ufid_user_removal_request (status);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ufid_user_removal_request_pending
+    ON ufid_user_removal_request (user_id)
+    WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS ufid_goldrush_user_alert (
+    user_id BIGINT NOT NULL REFERENCES ufid_user_account(id) ON DELETE CASCADE,
+    alert_id BIGINT NOT NULL REFERENCES ufid_goldrush_alert(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, alert_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_alert_alert
+    ON ufid_goldrush_user_alert (alert_id);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_alert_created
+    ON ufid_goldrush_user_alert (user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS ufid_goldrush_user_match (
+    user_id BIGINT NOT NULL,
+    alert_id BIGINT NOT NULL,
+    file_id BIGINT NOT NULL REFERENCES ufid_file(id) ON DELETE CASCADE,
+    matched_crc32 BOOLEAN NOT NULL,
+    matched_md5 BOOLEAN NOT NULL,
+    matched_sha1 BOOLEAN NOT NULL,
+    matched_sha256 BOOLEAN NOT NULL,
+    matched_blake3 BOOLEAN NOT NULL,
+    size_matched BOOLEAN NOT NULL,
+    found_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, alert_id, file_id),
+    FOREIGN KEY (user_id, alert_id)
+        REFERENCES ufid_goldrush_user_alert(user_id, alert_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_match_user
+    ON ufid_goldrush_user_match (user_id, found_at);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_match_alert
+    ON ufid_goldrush_user_match (alert_id);
+
+CREATE INDEX IF NOT EXISTS idx_ufid_goldrush_user_match_file
+    ON ufid_goldrush_user_match (file_id);
 
 CREATE TABLE IF NOT EXISTS ufid_audit_log (
     id BIGSERIAL PRIMARY KEY,

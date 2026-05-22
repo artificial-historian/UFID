@@ -19,6 +19,7 @@
         <a class="nav-link" href="/">Search</a>
         <a class="nav-link" href="/files.html">Known Files</a>
         <a class="nav-link active" href="/goldrush.html">Goldrush</a>
+        <a class="nav-link" href="/account.html">Account</a>
       </nav>
       <div id="apiStatus" class="status">Checking API</div>
       <form id="loginForm" class="auth-form">
@@ -106,6 +107,7 @@
               <input id="alertFilter" type="search" placeholder="Name, description, hash, source">
             </label>
             <button id="refreshAlertsButton" type="button">Refresh</button>
+            <button id="clearAlertsButton" class="danger-button" type="button">Erase My Alerts</button>
           </div>
 
           <div class="goldrush-table-shell">
@@ -144,6 +146,7 @@
               Filter Matches
               <input id="matchFilter" type="search" placeholder="Alert, UFID, filename, hash">
             </label>
+            <button id="searchMatchesButton" type="button">Search Matches</button>
             <button id="refreshMatchesButton" type="button">Refresh Matches</button>
             <div class="source-filter-bar" aria-label="Alert source filters">
               <span class="source-filter-label">Sources</span>
@@ -184,6 +187,6 @@
       </section>
     </main>
 
-    <script src="/goldrush.js" type="module"></script>
+    <script src="/goldrush.js?v=stored-matches-20260522" type="module"></script>
   </body>
 </html>

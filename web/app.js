@@ -683,7 +683,7 @@ async function fetchJson(url, options, fallbackMessage) {
       body = JSON.parse(text);
     } catch {
       if (!response.ok) {
-        throw new Error(`${fallbackMessage}: ${text}`);
+        throw new Error(`${fallbackMessage}: ${httpErrorSummary(response, text)}`);
       }
       throw new Error(`${fallbackMessage}: invalid JSON response`);
     }
@@ -696,6 +696,17 @@ async function fetchJson(url, options, fallbackMessage) {
     throw new Error(detail || fallbackMessage);
   }
   return body;
+}
+
+function httpErrorSummary(response, text) {
+  const status = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  const plainText = String(text || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return plainText ? `${status}: ${plainText.slice(0, 180)}` : status;
 }
 
 function formatBytes(bytes) {
