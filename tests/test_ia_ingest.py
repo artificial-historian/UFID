@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from email.message import Message
 from io import BytesIO, StringIO
 import gzip
@@ -27,6 +27,7 @@ from ufid.ia_client import (
     IAFile,
     IAHTTPClient,
     file_url,
+    is_ia_artifact_file,
     is_metadata_file,
     parse_item_metadata,
     safe_download_path,
@@ -420,8 +421,6 @@ def options(db_path: Path, state_path: Path, cache_path: Path) -> IngestOptions:
         min_size_bytes=None,
         max_size_bytes=None,
         original_only=False,
-        skip_metadata_files=False,
-        ia_artifacts=False,
         keep_cache=False,
         retry_failed=False,
         dry_run=False,
@@ -452,7 +451,6 @@ class InternetArchiveIngestTests(unittest.TestCase):
                 "--max-size",
                 "100k",
                 "--deep-discover-archives",
-                "--ia-artifacts",
             ]
         )
 
@@ -468,8 +466,6 @@ class InternetArchiveIngestTests(unittest.TestCase):
         self.assertEqual(with_limits.min_size_bytes, 10 * 1024)
         self.assertEqual(with_limits.max_size_bytes, 100 * 1024)
         self.assertTrue(with_limits.deep_discover_archives)
-        self.assertFalse(defaults.ia_artifacts)
-        self.assertTrue(with_limits.ia_artifacts)
 
     def test_parser_rejects_inverted_size_window(self) -> None:
         parsed = build_parser().parse_args(
@@ -477,6 +473,13 @@ class InternetArchiveIngestTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "min-size"):
             options_from_args(parsed)
+
+    def test_parser_rejects_removed_ia_artifact_filter_options(self) -> None:
+        for flag in ("--ia-artifacts", "--skip-metadata-files"):
+            with self.subTest(flag=flag):
+                with self.assertRaises(SystemExit):
+                    with redirect_stderr(StringIO()):
+                        build_parser().parse_args([flag])
 
     def test_size_limit_parser_accepts_magnitude_suffixes(self) -> None:
         self.assertEqual(parse_size_limit("100k"), 100 * 1024)
@@ -505,6 +508,8 @@ class InternetArchiveIngestTests(unittest.TestCase):
         self.assertTrue(is_metadata_file(IAFile(name="abc_meta.xml")))
         self.assertTrue(is_metadata_file(IAFile(name="meta.xml")))
         self.assertTrue(is_metadata_file(IAFile(name="anything.bin", format="Metadata")))
+        self.assertTrue(is_ia_artifact_file(IAFile(name="abc_archive.torrent")))
+        self.assertTrue(is_ia_artifact_file(IAFile(name="archive.torrent")))
         self.assertFalse(is_metadata_file(IAFile(name="profiles.xml")))
 
     def test_http_client_retries_429_with_retry_after(self) -> None:
@@ -750,11 +755,46 @@ class InternetArchiveIngestTests(unittest.TestCase):
         self.assertEqual(metadata_values(archive, "org.archive-btih"), ["download-btih"])
         self.assertEqual(metadata_values(archive, "org.archive-sha1"), [])
 
-    def test_metadata_mode_skips_ia_artifacts_by_default(self) -> None:
+    def test_download_updates_state_size_when_ia_metadata_omits_size(self) -> None:
         SCRATCH.mkdir(exist_ok=True)
-        db_path = SCRATCH / f"ia-ufid-artifact-skip-{uuid.uuid4().hex}.sqlite"
-        state_path = SCRATCH / f"ia-state-artifact-skip-{uuid.uuid4().hex}.sqlite"
-        cache_path = SCRATCH / f"ia-cache-artifact-skip-{uuid.uuid4().hex}"
+        db_path = SCRATCH / f"ia-ufid-download-size-state-{uuid.uuid4().hex}.sqlite"
+        state_path = SCRATCH / f"ia-state-download-size-state-{uuid.uuid4().hex}.sqlite"
+        cache_path = SCRATCH / f"ia-cache-download-size-state-{uuid.uuid4().hex}"
+        payload = zip_payload()
+        runner = IAIngestRunner(
+            options(db_path, state_path, cache_path),
+            client=FakeIAClient(payload, omit_file_fields=("size",)),
+        )
+        try:
+            with redirect_stdout(StringIO()):
+                stats = runner.run()
+        finally:
+            runner.close()
+
+        state = IAIngestState(state_path)
+        try:
+            row = state.connection.execute(
+                """
+                SELECT size_bytes
+                FROM ia_ingest_file
+                WHERE item_identifier = ?
+                  AND name = ?
+                """,
+                ("fake-software-item", "downloads/archive.zip"),
+            ).fetchone()
+        finally:
+            state.close()
+
+        self.assertEqual(stats.processed_files, 1)
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["size_bytes"], len(payload))
+
+    def test_metadata_mode_tags_ia_artifacts(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"ia-ufid-artifact-tag-{uuid.uuid4().hex}.sqlite"
+        state_path = SCRATCH / f"ia-state-artifact-tag-{uuid.uuid4().hex}.sqlite"
+        cache_path = SCRATCH / f"ia-cache-artifact-tag-{uuid.uuid4().hex}"
         payload = zip_payload()
         artifact_records = (
             ia_file_record(
@@ -775,6 +815,12 @@ class InternetArchiveIngestTests(unittest.TestCase):
                 source="metadata",
                 file_format="Metadata",
             ),
+            ia_file_record(
+                "fake-software-item_archive.torrent",
+                b"torrent metadata",
+                source="metadata",
+                file_format="Archive BitTorrent",
+            ),
         )
         opts = options(db_path, state_path, cache_path)
         opts = IngestOptions(**{**opts.__dict__, "mode": "metadata"})
@@ -794,54 +840,35 @@ class InternetArchiveIngestTests(unittest.TestCase):
         finally:
             state.close()
 
-        self.assertEqual(stats.skipped_files, 3)
-        self.assertEqual({file["display_name"] for file in files}, {"archive.zip"})
-        self.assertEqual([file.name for file in queued], ["downloads/archive.zip"])
-
-    def test_metadata_mode_includes_ia_artifacts_when_requested(self) -> None:
-        SCRATCH.mkdir(exist_ok=True)
-        db_path = SCRATCH / f"ia-ufid-artifact-include-{uuid.uuid4().hex}.sqlite"
-        state_path = SCRATCH / f"ia-state-artifact-include-{uuid.uuid4().hex}.sqlite"
-        cache_path = SCRATCH / f"ia-cache-artifact-include-{uuid.uuid4().hex}"
-        payload = zip_payload()
-        artifact_record = ia_file_record(
-            "fake-software-item_meta.xml",
-            b"<metadata />",
-            source="metadata",
-            file_format="Metadata",
-        )
-        opts = options(db_path, state_path, cache_path)
-        opts = IngestOptions(
-            **{
-                **opts.__dict__,
-                "mode": "metadata",
-                "ia_artifacts": True,
-            }
-        )
-        client = FakeIAClient(payload, extra_file_records=(artifact_record,))
-        runner = IAIngestRunner(opts, client=client)
-        try:
-            with redirect_stdout(StringIO()):
-                stats = runner.run()
-        finally:
-            runner.close()
-
-        with closing(connect(db_path)) as connection:
-            files = list_files(connection)
-        state = IAIngestState(state_path)
-        try:
-            queued = state.iter_processable_files(retry_failed=False)
-        finally:
-            state.close()
-
         self.assertEqual(stats.skipped_files, 0)
         self.assertEqual(
             {file["display_name"] for file in files},
-            {"archive.zip", "fake-software-item_meta.xml"},
+            {
+                "archive.zip",
+                "fake-software-item_files.xml",
+                "fake-software-item_meta.sqlite",
+                "fake-software-item_meta.xml",
+                "fake-software-item_archive.torrent",
+            },
         )
         self.assertEqual(
             {file.name for file in queued},
-            {"downloads/archive.zip", "fake-software-item_meta.xml"},
+            {
+                "downloads/archive.zip",
+                "fake-software-item_files.xml",
+                "fake-software-item_meta.sqlite",
+                "fake-software-item_meta.xml",
+                "fake-software-item_archive.torrent",
+            },
+        )
+        artifact_files = [
+            file
+            for file in files
+            if file["display_name"] != "archive.zip"
+        ]
+        self.assertEqual(
+            {metadata_values(file, "tag")[0] for file in artifact_files},
+            {"IA Artefacts"},
         )
 
     def test_metadata_mode_marks_files_that_need_downloaded_identity(self) -> None:

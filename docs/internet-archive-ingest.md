@@ -157,7 +157,7 @@ Use a descriptive Internet Archive User-Agent:
 ufid ia-ingest `
   --backend https://ufid.example.com `
   --collection software `
-  --user-agent "UFID-IA-Ingest/0.8 (gpt-5; contact: you@example.com)"
+  --user-agent "UFID-IA-Ingest/0.9 (gpt-5; contact: you@example.com)"
 ```
 
 Do not use browser-spoofed or stealth User-Agent strings. A clear tool name and
@@ -215,16 +215,14 @@ member expansion. Plain single-file compression derivatives such as
 `*_hocr.html.gz` are not archive-scan candidates by default. Crawl index/data
 files ending in `.cdx.gz` or `.warc.gz` are always treated as non-archive files.
 Internet Archive-generated artifact files such as `*_files.xml`,
-`*_meta.sqlite`, and `*_meta.xml` are skipped by default during IA metadata
-harvesting and download processing because UFID already records the useful IA
-context as metadata. Pass `--ia-artifacts` to include those files as UFID file
-records.
+`*_meta.sqlite`, `*_meta.xml`, and `*_archive.torrent` are ingested when they
+have enough identity data. UFID tags recognized artifact records with
+`IA Artefacts` metadata so they remain distinguishable from original item files.
 
 Useful limiting flags:
 
 ```powershell
 --original-only
---ia-artifacts
 --max-file-bytes 1073741824
 --min-size 1M
 --max-size 2G

@@ -342,15 +342,19 @@ Authorization: Bearer <token>
 ```http
 GET /api/v1/goldrush/alerts?limit=200&offset=0&q=<filter>
 GET /api/v1/goldrush/alert-sources
-GET /api/v1/goldrush/matches?limit=200&offset=0&q=<filter>&source_key=<source>
+GET /api/v1/goldrush/ufid-sources
+GET /api/v1/goldrush/matches?limit=200&offset=0&q=<filter>&source_key=<alert-list>&ufid_source=<ufid-source>
 Authorization: Bearer <token>
 ```
 
-The `alert-sources` endpoint returns source buckets for the current user's match
-filtering. Manual alerts use `source_key=manual`; imported alerts use a stable
-source key derived from their import type and source name. The matches endpoint
-accepts repeated `source_key` parameters to restrict stored results to one or
-more alert sources in the current user's set.
+The `alert-sources` endpoint returns alert-list buckets for the current user's
+match filtering. Manual alerts use `source_key=manual`; imported alert lists use
+a stable source key derived from their import type and source name. The
+`ufid-sources` endpoint returns available UFID source table values. The matches
+endpoint accepts repeated `source_key` parameters to restrict stored results to
+one or more alert lists, and repeated `ufid_source` parameters to restrict
+stored results to one or more UFID source values, including sources inherited
+through archive parents.
 
 ```http
 POST /api/v1/goldrush/matches/search
@@ -451,6 +455,50 @@ hashes with an existing record, but does not match the full required identity
 tuple, UFID stores it as a distinct file and logs `required_hash_overlap`
 warnings. This captures possible hash-collision evidence without merging files
 that have different full identities.
+
+## Import DAT Rows As UFID File Identities
+
+```http
+POST /api/v1/files/import-dat
+Content-Type: application/json
+Authorization: Bearer <token>
+```
+
+Imports Logiqx DAT files in XML or classic text syntax into UFID file identity
+records. This is separate from Goldrush DAT alert import. Only rows with exact
+`size_bytes`, `crc32`, `md5`, and `sha1` can become UFID file records; partial
+hash rows are reported in `errors` and remain suitable for Goldrush alerts.
+
+```json
+{
+  "filename": "example.dat",
+  "text": "<datafile>...</datafile>"
+}
+```
+
+Imported records link the file to the `logiqx_dat` UFID source and store DAT
+provenance as file metadata, including `dat_source_name`, `dat_set_name`,
+`dat_entry_name`, and `dat_filename` when supplied.
+
+```json
+{
+  "source_name": "Example DAT",
+  "parsed": 2,
+  "received": 2,
+  "valid": 1,
+  "created": 1,
+  "enriched": 0,
+  "unchanged": 0,
+  "skipped": 1,
+  "errors": [
+    {
+      "index": 1,
+      "name": "partial.bin",
+      "error": "Required hashes are missing: md5, sha1"
+    }
+  ]
+}
+```
 
 ## Add Archive Membership
 

@@ -148,9 +148,13 @@
             </label>
             <button id="searchMatchesButton" type="button">Search Matches</button>
             <button id="refreshMatchesButton" type="button">Refresh Matches</button>
-            <div class="source-filter-bar" aria-label="Alert source filters">
-              <span class="source-filter-label">Sources</span>
+            <div class="source-filter-bar" aria-label="Alert list filters">
+              <span class="source-filter-label">Alert lists</span>
               <div id="matchSourceFilters" class="source-filter-list"></div>
+            </div>
+            <div class="source-filter-bar" aria-label="UFID source filters">
+              <span class="source-filter-label">UFID sources</span>
+              <div id="matchUfidSourceFilters" class="source-filter-list"></div>
             </div>
           </div>
 
@@ -160,15 +164,14 @@
                 <tr>
                   <th>Alert</th>
                   <th>UFID File</th>
+                  <th>Source</th>
                   <th>IA Item</th>
                   <th>Matched</th>
-                  <th>Alert Hashes</th>
-                  <th>File Hashes</th>
                 </tr>
               </thead>
               <tbody id="matchesTable">
                 <tr>
-                  <td colspan="6">No matches loaded.</td>
+                  <td colspan="5">No matches loaded.</td>
                 </tr>
               </tbody>
             </table>
@@ -187,6 +190,6 @@
       </section>
     </main>
 
-    <script src="/goldrush.js?v=stored-matches-20260522" type="module"></script>
+    <script src="/goldrush.js?v=ufid-source-filters-20260523" type="module"></script>
   </body>
 </html>

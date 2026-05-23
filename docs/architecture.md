@@ -103,10 +103,6 @@ src/
     paths.py
     server.py
     web/
-web/
-  app.js
-  index.html
-  styles.css
 tests/
   test_hashing.py
 ```

@@ -142,7 +142,8 @@ def _alert_from_dat_row(
 
 
 def _tokenize_classic_dat(text: str) -> list[str]:
-    token_pattern = re.compile(r'"(?:\\.|[^"\\])*"|[()]|[^\s()]+')
+    # Unquoted ROM names may contain parentheses, so only standalone parens delimit blocks.
+    token_pattern = re.compile(r'"(?:\\.|[^"\\])*"|(?<!\S)[()](?!\S)|[^\s]+')
     return token_pattern.findall(text)
 
 

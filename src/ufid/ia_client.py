@@ -500,21 +500,27 @@ IA_ARTIFACT_SUFFIXES = (
     "_meta.xml",
     "_reviews.xml",
     "_itemimage.jpg",
+    "_archive.torrent",
 )
 IA_ARTIFACT_BASENAMES = {
     "files.xml",
     "meta.sqlite",
     "meta.xml",
+    "archive.torrent",
 }
 
 
-def is_metadata_file(ia_file: IAFile) -> bool:
+def is_ia_artifact_file(ia_file: IAFile) -> bool:
     name = PurePosixPath(ia_file.name).name.lower()
     return (
         ia_file.format == "Metadata"
         or name in IA_ARTIFACT_BASENAMES
         or name.endswith(IA_ARTIFACT_SUFFIXES)
     )
+
+
+def is_metadata_file(ia_file: IAFile) -> bool:
+    return is_ia_artifact_file(ia_file)
 
 
 def verify_declared_fixity(

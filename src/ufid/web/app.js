@@ -21,6 +21,7 @@ const descriptionInput = document.querySelector("#descriptionInput");
 const dropZone = document.querySelector("#dropZone");
 const fileInput = document.querySelector("#fileInput");
 const hashTable = document.querySelector("#hashTable");
+const importDatToUfidButton = document.querySelector("#importDatToUfidButton");
 const manualAlgorithm = document.querySelector("#manualAlgorithm");
 const manualHash = document.querySelector("#manualHash");
 const manualLookup = document.querySelector("#manualLookup");
@@ -38,6 +39,8 @@ const metadataValueInput = document.querySelector("#metadataValueInput");
 const recordDetails = document.querySelector("#recordDetails");
 const recordState = document.querySelector("#recordState");
 const resetButton = document.querySelector("#resetButton");
+const ufidDatFileInput = document.querySelector("#ufidDatFileInput");
+const ufidDatImportState = document.querySelector("#ufidDatImportState");
 const searchButton = document.querySelector("#searchButton");
 const selectedFile = document.querySelector("#selectedFile");
 const sessionPanel = document.querySelector("#sessionPanel");
@@ -120,6 +123,46 @@ addButton.addEventListener("click", async () => {
     await lookupHash("sha1", state.hashes.sha1, state.sizeBytes);
   } catch (error) {
     setRecordState(error.message, "error");
+  }
+});
+
+importDatToUfidButton.addEventListener("click", async () => {
+  if (!state.user) {
+    setDatImportState("Log in to import DAT", "warn");
+    return;
+  }
+  if (!hasRole("contributor")) {
+    setDatImportState("Contributor role required", "warn");
+    return;
+  }
+  const file = ufidDatFileInput.files?.[0];
+  if (!file) {
+    setDatImportState("Choose a DAT file", "warn");
+    return;
+  }
+
+  setDatImportState("Reading DAT", "quiet");
+  importDatToUfidButton.disabled = true;
+  try {
+    const text = await file.text();
+    setDatImportState("Importing DAT", "quiet");
+    const body = await fetchJson("/api/v1/files/import-dat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name, text }),
+    }, "DAT import failed");
+    const parts = [
+      `${body.created || 0} created`,
+      `${body.enriched || 0} enriched`,
+      `${body.unchanged || 0} unchanged`,
+      `${body.skipped || 0} skipped`,
+    ];
+    setDatImportState(parts.join(", "), body.skipped ? "warn" : "ok");
+    await browseFiles();
+  } catch (error) {
+    setDatImportState(error.message, "error");
+  } finally {
+    updateActionState();
   }
 });
 
@@ -578,6 +621,11 @@ function setRecordState(message, type) {
   recordState.className = `status ${type}`;
 }
 
+function setDatImportState(message, type) {
+  ufidDatImportState.textContent = message;
+  ufidDatImportState.className = `status ${type}`;
+}
+
 async function checkApi() {
   try {
     await fetchJson("/health", undefined, "API unavailable");
@@ -666,6 +714,12 @@ function updateActionState() {
   searchButton.disabled = !authenticated || !hasHashes;
   addButton.disabled = !authenticated || !hasHashes;
   browseButton.disabled = !authenticated;
+  importDatToUfidButton.disabled = !authenticated || !hasRole("contributor");
+}
+
+function hasRole(role) {
+  const roles = state.user?.roles || [];
+  return roles.includes(role) || roles.includes("admin");
 }
 
 async function fetchJson(url, options, fallbackMessage) {

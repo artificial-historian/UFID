@@ -1,5 +1,6 @@
 const PAGE_LIMIT = 200;
 const HASH_COLUMNS = ["crc32", "md5", "sha1", "sha256", "blake3"];
+const DEFAULT_UFID_SOURCE_VALUE = "internet_archive";
 
 const state = {
   user: null,
@@ -21,6 +22,9 @@ const state = {
   sourceOptions: [],
   selectedSourceKeys: [],
   loadingSources: false,
+  ufidSourceOptions: [],
+  selectedUfidSources: [DEFAULT_UFID_SOURCE_VALUE],
+  loadingUfidSources: false,
 };
 
 let alertsFilterTimer = null;
@@ -65,6 +69,7 @@ const matchesPreviousButton = document.querySelector("#matchesPreviousButton");
 const matchesSummary = document.querySelector("#matchesSummary");
 const matchesTable = document.querySelector("#matchesTable");
 const matchSourceFilters = document.querySelector("#matchSourceFilters");
+const matchUfidSourceFilters = document.querySelector("#matchUfidSourceFilters");
 const refreshAlertsButton = document.querySelector("#refreshAlertsButton");
 const refreshMatchesButton = document.querySelector("#refreshMatchesButton");
 const searchMatchesButton = document.querySelector("#searchMatchesButton");
@@ -191,6 +196,33 @@ if (matchSourceFilters) {
   });
 }
 
+if (matchUfidSourceFilters) {
+  matchUfidSourceFilters.addEventListener("click", async (event) => {
+    const button = event.target?.closest?.("[data-ufid-source]");
+    if (!button || state.loadingMatches || state.loadingUfidSources || state.clearingAlerts) {
+      return;
+    }
+    const source = button.dataset.ufidSource || "";
+    if (!source) {
+      if (!state.selectedUfidSources.length) {
+        return;
+      }
+      state.selectedUfidSources = [];
+    } else {
+      const selected = new Set(state.selectedUfidSources);
+      if (selected.has(source)) {
+        selected.delete(source);
+      } else {
+        selected.add(source);
+      }
+      state.selectedUfidSources = [...selected];
+    }
+    state.matchesPage = 1;
+    renderUfidSourceFilters();
+    await loadMatches();
+  });
+}
+
 async function checkApi() {
   try {
     await fetchJson("/health", undefined, "API unavailable");
@@ -205,10 +237,11 @@ async function checkApi() {
   apiStatus.className = "status ok";
   await loadSession();
   if (state.user) {
-    await loadAlertSources();
+    await loadMatchFilterOptions();
     await loadAlerts();
   } else {
     renderSourceFilters();
+    renderUfidSourceFilters();
     renderAlertsMessage("Log in to manage Goldrush alerts.");
     renderMatchesMessage("Log in to view Goldrush matches.");
     setGoldrushState("Login required", "warn");
@@ -236,7 +269,7 @@ async function login() {
     state.matchesPage = 1;
     renderSession();
     setGoldrushState(`Logged in as ${state.user.username}`, "ok");
-    await loadAlertSources();
+    await loadMatchFilterOptions();
     await loadAlerts();
     if (state.activeTab === "matches") {
       await loadMatches();
@@ -267,8 +300,11 @@ async function logout() {
   state.matchesTotal = 0;
   state.sourceOptions = [];
   state.selectedSourceKeys = [];
+  state.ufidSourceOptions = [];
+  state.selectedUfidSources = [DEFAULT_UFID_SOURCE_VALUE];
   renderSession();
   renderSourceFilters();
+  renderUfidSourceFilters();
   renderAlertsMessage("Log in to manage Goldrush alerts.");
   renderMatchesMessage("Log in to view Goldrush matches.");
   setGoldrushState("Logged out", "quiet");
@@ -328,7 +364,7 @@ async function addAlert() {
       setGoldrushState("Alert already existed", "quiet");
     }
     await loadAlerts();
-    await loadAlertSources();
+    await loadMatchFilterOptions();
     state.matchesPage = 1;
     if (state.activeTab === "matches") {
       await loadMatches();
@@ -370,7 +406,7 @@ async function importDat() {
     state.alertsPage = 1;
     state.matchesPage = 1;
     await loadAlerts();
-    await loadAlertSources();
+    await loadMatchFilterOptions();
     if (state.activeTab === "matches") {
       await loadMatches();
     }
@@ -403,6 +439,7 @@ async function clearAlerts() {
   state.loadingAlerts = false;
   state.loadingMatches = false;
   state.loadingSources = false;
+  state.loadingUfidSources = false;
   setGoldrushState("Erasing alerts", "quiet");
   renderSession();
   try {
@@ -419,7 +456,10 @@ async function clearAlerts() {
     state.matchesTotal = 0;
     state.sourceOptions = [];
     state.selectedSourceKeys = [];
+    state.ufidSourceOptions = [];
+    state.selectedUfidSources = [DEFAULT_UFID_SOURCE_VALUE];
     renderSourceFilters();
+    renderUfidSourceFilters();
     renderAlertsMessage("No alerts.");
     renderMatchesMessage("No UFID hits.");
     setGoldrushState(`${body.deleted || 0} alerts erased`, "ok");
@@ -429,6 +469,10 @@ async function clearAlerts() {
     state.clearingAlerts = false;
     renderSession();
   }
+}
+
+async function loadMatchFilterOptions() {
+  await Promise.all([loadAlertSources(), loadUfidSources()]);
 }
 
 async function loadAlertSources() {
@@ -452,6 +496,33 @@ async function loadAlertSources() {
   } finally {
     state.loadingSources = false;
     renderSourceFilters();
+    renderSession();
+  }
+}
+
+async function loadUfidSources() {
+  if (!state.user) {
+    state.ufidSourceOptions = [];
+    state.selectedUfidSources = [DEFAULT_UFID_SOURCE_VALUE];
+    renderUfidSourceFilters();
+    return;
+  }
+
+  state.loadingUfidSources = true;
+  renderUfidSourceFilters();
+  try {
+    const body = await fetchJson("/api/v1/goldrush/ufid-sources", undefined, "Load UFID sources failed");
+    state.ufidSourceOptions = body.sources || [];
+    const validValues = new Set(state.ufidSourceOptions.map((source) => source.source_value).filter(Boolean));
+    state.selectedUfidSources = state.selectedUfidSources.filter(
+      (source) => validValues.has(source) || source === DEFAULT_UFID_SOURCE_VALUE,
+    );
+    renderUfidSourceFilters();
+  } catch (error) {
+    setGoldrushState(error.message, "error");
+  } finally {
+    state.loadingUfidSources = false;
+    renderUfidSourceFilters();
     renderSession();
   }
 }
@@ -527,6 +598,9 @@ async function loadMatches() {
   state.selectedSourceKeys.forEach((key) => {
     params.append("source_key", key);
   });
+  state.selectedUfidSources.forEach((source) => {
+    params.append("ufid_source", source);
+  });
 
   try {
     const body = await fetchJson(`/api/v1/goldrush/matches?${params.toString()}`, undefined, "Load matches failed");
@@ -584,6 +658,7 @@ async function searchMatches() {
     state.matchesPage = 1;
     state.loadingMatches = false;
     stopMatchesLoadingFeedback();
+    await loadMatchFilterOptions();
     await loadMatches();
   } catch (error) {
     if (requestId !== state.matchesRequestId) {
@@ -632,7 +707,11 @@ function renderAlertRow(alert) {
 }
 
 function renderMatches() {
-  const filtering = Boolean(state.matchesFilter || state.selectedSourceKeys.length);
+  const filtering = Boolean(
+    state.matchesFilter
+    || state.selectedSourceKeys.length
+    || state.selectedUfidSources.length
+  );
   if (!state.matchesTotal) {
     renderMatchesMessage(filtering ? "No matching UFID hits." : "No UFID hits.");
     setGoldrushState(filtering ? "0 matching hits" : "0 hits", filtering ? "warn" : "quiet");
@@ -641,7 +720,7 @@ function renderMatches() {
   matchesTable.innerHTML = state.matches.map(renderMatchRow).join("");
   const start = (state.matchesPage - 1) * PAGE_LIMIT + 1;
   const end = start + state.matches.length - 1;
-  const sourceSummary = selectedSourceSummary();
+  const sourceSummary = selectedFilterSummary();
   const suffix = sourceSummary ? ` from ${sourceSummary}` : "";
   setGoldrushState(`${start}-${end} of ${state.matchesTotal} hits${suffix}`, "ok");
   renderMatchPagination();
@@ -662,6 +741,7 @@ function renderMatchRow(match) {
         <span class="meta-type">${escapeHtml(file.display_name || "")}</span>
         <span class="meta-type">${escapeHtml(formatBytes(file.size_bytes))}</span>
       </td>
+      <td>${renderMatchSource(file)}</td>
       <td class="ia-link-cell">${renderIaItemLink(file.internet_archive, file.id)}</td>
       <td>
         <div class="chip-list">
@@ -669,9 +749,25 @@ function renderMatchRow(match) {
           ${match.size_matched ? '<span class="chip">size</span>' : ""}
         </div>
       </td>
-      <td>${renderHashList(alert.hashes || {}, matched)}</td>
-      <td>${renderHashList(file.hashes || {}, matched)}</td>
     </tr>
+  `;
+}
+
+function renderMatchSource(file) {
+  const source = file?.source;
+  if (!source) {
+    return '<span class="meta-type">Unspecified</span>';
+  }
+  const internetArchive = file?.internet_archive;
+  const detail = source.source_value === DEFAULT_UFID_SOURCE_VALUE && internetArchive
+    ? [
+        internetArchive.identifier,
+        internetArchive.file_format || internetArchive.file_source || internetArchive.file_name,
+      ].filter(Boolean).join(" / ")
+    : source.description || source.external_reference || "";
+  return `
+    <strong>${escapeHtml(source.label || source.source_value || "")}</strong>
+    ${detail ? `<span class="meta-type">${escapeHtml(detail)}</span>` : ""}
   `;
 }
 
@@ -692,7 +788,7 @@ function renderHashList(hashes, highlights = []) {
 
 function renderIaItemLink(source, fileId) {
   if (!source) {
-    return '<span class="meta-type">No IA source</span>';
+    return '<span class="meta-type">No IA item link</span>';
   }
   const href = safeHttpUrl(source.item_url);
   const identifier = source.identifier || "Internet Archive item";
@@ -724,7 +820,7 @@ function renderAlertsMessage(message) {
 }
 
 function renderMatchesMessage(message) {
-  matchesTable.innerHTML = `<tr><td colspan="6">${escapeHtml(message)}</td></tr>`;
+  matchesTable.innerHTML = `<tr><td colspan="5">${escapeHtml(message)}</td></tr>`;
   renderMatchPagination();
 }
 
@@ -741,7 +837,7 @@ function renderSourceFilters() {
 
   const allActive = state.selectedSourceKeys.length === 0;
   const buttons = [
-    renderSourceFilterButton("", "All sources", allActive, disabled),
+    renderSourceFilterButton("", "All alert lists", allActive, disabled),
     ...state.sourceOptions.map((source) => {
       const key = source.source_key || "";
       const active = state.selectedSourceKeys.includes(key);
@@ -749,6 +845,30 @@ function renderSourceFilters() {
     }),
   ];
   matchSourceFilters.innerHTML = buttons.join("");
+}
+
+function renderUfidSourceFilters() {
+  if (!matchUfidSourceFilters) {
+    return;
+  }
+  const authenticated = Boolean(state.user);
+  const disabled = !authenticated || state.loadingMatches || state.loadingUfidSources || state.clearingAlerts;
+  if (!authenticated) {
+    matchUfidSourceFilters.innerHTML = "";
+    return;
+  }
+
+  const options = ufidSourceOptionsWithSelected();
+  const allActive = state.selectedUfidSources.length === 0;
+  const buttons = [
+    renderUfidSourceFilterButton("", "All UFID sources", allActive, disabled),
+    ...options.map((source) => {
+      const value = source.source_value || "";
+      const active = state.selectedUfidSources.includes(value);
+      return renderUfidSourceFilterButton(value, ufidSourceOptionLabel(source), active, disabled);
+    }),
+  ];
+  matchUfidSourceFilters.innerHTML = buttons.join("");
 }
 
 function renderSourceFilterButton(key, label, active, disabled) {
@@ -763,10 +883,62 @@ function renderSourceFilterButton(key, label, active, disabled) {
   `;
 }
 
+function renderUfidSourceFilterButton(source, label, active, disabled) {
+  return `
+    <button
+      class="source-filter-button${active ? " active" : ""}"
+      type="button"
+      data-ufid-source="${escapeHtml(source)}"
+      aria-pressed="${active ? "true" : "false"}"
+      ${disabled ? "disabled" : ""}
+    >${escapeHtml(label)}</button>
+  `;
+}
+
 function sourceOptionLabel(source) {
-  const count = Number(source.alert_count || 0);
+  const entries = Number(source.alert_count || 0);
+  const hits = Number(source.hit_count || 0);
   const label = source.label || source.source_name || source.source_type || "Manual";
-  return count > 0 ? `${label} (${count})` : label;
+  return entries > 0 ? `${label} (${hits}/${entries})` : label;
+}
+
+function ufidSourceOptionsWithSelected() {
+  const byValue = new Map(
+    state.ufidSourceOptions
+      .filter((source) => source.source_value)
+      .map((source) => [source.source_value, source]),
+  );
+  state.selectedUfidSources.forEach((source) => {
+    if (source && !byValue.has(source)) {
+      byValue.set(source, {
+        source_value: source,
+        label: ufidSourceLabel(source),
+        hit_count: 0,
+      });
+    }
+  });
+  return [...byValue.values()].sort((left, right) => {
+    if (left.source_value === DEFAULT_UFID_SOURCE_VALUE) {
+      return -1;
+    }
+    if (right.source_value === DEFAULT_UFID_SOURCE_VALUE) {
+      return 1;
+    }
+    return ufidSourceLabel(left.source_value).localeCompare(ufidSourceLabel(right.source_value));
+  });
+}
+
+function ufidSourceOptionLabel(source) {
+  const hits = Number(source.hit_count || 0);
+  const label = source.label || ufidSourceLabel(source.source_value);
+  return hits > 0 ? `${label} (${hits})` : label;
+}
+
+function ufidSourceLabel(source) {
+  if (source === DEFAULT_UFID_SOURCE_VALUE) {
+    return "Internet Archive";
+  }
+  return source || "Unknown";
 }
 
 function selectedSourceSummary() {
@@ -780,6 +952,23 @@ function selectedSourceSummary() {
     ]),
   );
   return state.selectedSourceKeys.map((key) => labels.get(key) || key).join(", ");
+}
+
+function selectedUfidSourceSummary() {
+  if (!state.selectedUfidSources.length) {
+    return "";
+  }
+  const labels = new Map(
+    ufidSourceOptionsWithSelected().map((source) => [
+      source.source_value,
+      source.label || ufidSourceLabel(source.source_value),
+    ]),
+  );
+  return state.selectedUfidSources.map((source) => labels.get(source) || ufidSourceLabel(source)).join(", ");
+}
+
+function selectedFilterSummary() {
+  return [selectedSourceSummary(), selectedUfidSourceSummary()].filter(Boolean).join(", ");
 }
 
 function startMatchesLoadingFeedback(requestId) {
@@ -808,7 +997,7 @@ function renderMatchesLoadingMessage() {
     : 0;
   const elapsed = elapsedSeconds >= 1 ? ` (${elapsedSeconds.toFixed(1)}s)` : "";
   renderMatchesMessage(`Searching matches${elapsed}.`);
-  const sourceSummary = selectedSourceSummary();
+  const sourceSummary = selectedFilterSummary();
   matchesSummary.textContent = sourceSummary
     ? `Scanning ${sourceSummary} alert hashes against known files.`
     : "Scanning alert hashes against known files.";
@@ -841,6 +1030,7 @@ function renderSession() {
   renderAlertPagination();
   renderMatchPagination();
   renderSourceFilters();
+  renderUfidSourceFilters();
 }
 
 function renderAlertPagination() {

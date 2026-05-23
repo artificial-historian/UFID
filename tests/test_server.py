@@ -24,9 +24,10 @@ from ufid.server import UFIDRequestHandler, _coerce_metadata_payload, _is_sqlite
 from ufid.database import connect, create_user
 from ufid.goldrush import parse_logiqx_dat
 from ufid import add, lookup
-from ufid.paths import default_user_data_dir
+from ufid.paths import default_user_data_dir, resolve_web_root
 
 SCRATCH = default_user_data_dir() / "test-runs"
+WEB_ROOT = resolve_web_root(None)
 
 
 class ServerTests(unittest.TestCase):
@@ -46,7 +47,7 @@ class ServerTests(unittest.TestCase):
         handler_class = type(
             "TestUFIDRequestHandler",
             (UFIDRequestHandler,),
-            {"db_path": db_path, "web_root": ROOT / "web"},
+            {"db_path": db_path, "web_root": WEB_ROOT},
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -140,7 +141,7 @@ class ServerTests(unittest.TestCase):
         handler_class = type(
             "TestUFIDListRequestHandler",
             (UFIDRequestHandler,),
-            {"db_path": db_path, "web_root": ROOT / "web"},
+            {"db_path": db_path, "web_root": WEB_ROOT},
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -208,7 +209,7 @@ class ServerTests(unittest.TestCase):
         handler_class = type(
             "TestUFIDParallelRequestHandler",
             (UFIDRequestHandler,),
-            {"db_path": db_path, "web_root": ROOT / "web"},
+            {"db_path": db_path, "web_root": WEB_ROOT},
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -266,7 +267,7 @@ class ServerTests(unittest.TestCase):
         handler_class = type(
             "TestUFIDGoldrushRequestHandler",
             (UFIDRequestHandler,),
-            {"db_path": db_path, "web_root": ROOT / "web"},
+            {"db_path": db_path, "web_root": WEB_ROOT},
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -293,6 +294,32 @@ class ServerTests(unittest.TestCase):
                 },
                 token=token,
             )
+            with closing(connect(db_path)) as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO ufid_source (name, description)
+                        VALUES (?, ?)
+                        """,
+                        ("internet_archive", "Internet Archive"),
+                    )
+                    source_id = int(
+                        connection.execute(
+                            "SELECT id FROM ufid_source WHERE name = ?",
+                            ("internet_archive",),
+                        ).fetchone()["id"]
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO ufid_file_source (
+                            file_id,
+                            source_id,
+                            external_reference
+                        )
+                        VALUES (?, ?, ?)
+                        """,
+                        (created_file["id"], source_id, ""),
+                    )
             manual_alert = self._post_json(
                 f"{base_url}/api/v1/goldrush/alerts",
                 {
@@ -368,6 +395,14 @@ class ServerTests(unittest.TestCase):
                 {},
                 token=token,
             )
+            sources_after_search = self._get_json(
+                f"{base_url}/api/v1/goldrush/alert-sources",
+                token=token,
+            )
+            ufid_sources_after_search = self._get_json(
+                f"{base_url}/api/v1/goldrush/ufid-sources",
+                token=token,
+            )
             manual_matches = self._get_json(
                 f"{base_url}/api/v1/goldrush/matches?q=Manual",
                 token=token,
@@ -382,6 +417,14 @@ class ServerTests(unittest.TestCase):
             )
             dat_source_matches = self._get_json(
                 f"{base_url}/api/v1/goldrush/matches?{urlencode({'source_key': dat_source_key})}",
+                token=token,
+            )
+            ia_ufid_source_matches = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches?ufid_source=internet_archive",
+                token=token,
+            )
+            other_ufid_source_matches = self._get_json(
+                f"{base_url}/api/v1/goldrush/matches?ufid_source=manual_upload",
                 token=token,
             )
             with self.assertRaises(HTTPError) as raised:
@@ -409,6 +452,10 @@ class ServerTests(unittest.TestCase):
             )
             sources_after_clear = self._get_json(
                 f"{base_url}/api/v1/goldrush/alert-sources",
+                token=token,
+            )
+            ufid_sources_after_clear = self._get_json(
+                f"{base_url}/api/v1/goldrush/ufid-sources",
                 token=token,
             )
             other_alerts_after_clear = self._get_json(
@@ -451,6 +498,24 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(dat_matches["matches"][0]["size_matched"])
         self.assertEqual(sources["count"], 2)
         self.assertEqual(source_keys, {"manual", "logiqx-dat-xml|Goldrush Test DAT"})
+        source_counts = {
+            source["source_key"]: source
+            for source in sources_after_search["sources"]
+        }
+        self.assertEqual(source_counts["manual"]["alert_count"], 1)
+        self.assertEqual(source_counts["manual"]["hit_count"], 1)
+        self.assertEqual(source_counts[dat_source_key]["alert_count"], 1)
+        self.assertEqual(source_counts[dat_source_key]["hit_count"], 1)
+        self.assertEqual(
+            ufid_sources_after_search["sources"],
+            [
+                {
+                    "source_value": "internet_archive",
+                    "label": "Internet Archive",
+                    "hit_count": 2,
+                }
+            ],
+        )
         self.assertEqual(manual_source_matches["total_count"], 1)
         self.assertEqual(
             manual_source_matches["matches"][0]["alert"]["name"],
@@ -461,12 +526,29 @@ class ServerTests(unittest.TestCase):
             dat_source_matches["matches"][0]["alert"]["name"],
             "Goldrush Set",
         )
+        self.assertEqual(ia_ufid_source_matches["total_count"], 2)
+        self.assertEqual(
+            {
+                match["file"]["source"]["label"]
+                for match in ia_ufid_source_matches["matches"]
+            },
+            {"Internet Archive"},
+        )
+        self.assertEqual(
+            {
+                match["file"]["source"]["source_value"]
+                for match in ia_ufid_source_matches["matches"]
+            },
+            {"internet_archive"},
+        )
+        self.assertEqual(other_ufid_source_matches["total_count"], 0)
         self.assertEqual(raised.exception.code, 400)
         raised.exception.close()
         self.assertEqual(cleared["deleted"], 2)
         self.assertEqual(alerts_after_clear["total_count"], 0)
         self.assertEqual(matches_after_clear["total_count"], 0)
         self.assertEqual(sources_after_clear["count"], 0)
+        self.assertEqual(ufid_sources_after_clear["count"], 1)
         self.assertEqual(other_alerts_after_clear["total_count"], 1)
 
     def test_classic_logiqx_dat_parser(self) -> None:
@@ -491,6 +573,93 @@ game (
         self.assertEqual(alert["source_detail"], "classic.bin")
         self.assertEqual(alert["hashes"]["crc32"], "22222222")
 
+    def test_classic_logiqx_dat_parser_accepts_unquoted_parentheses(self) -> None:
+        summary = parse_logiqx_dat(
+            """
+clrmamepro (
+  name "Classic DAT"
+)
+game (
+  name "Classic Set"
+  rom ( name path\\grass(hp).tc size 228282 crc 9b083404 )
+)
+"""
+        )
+
+        self.assertEqual(len(summary.alerts), 1)
+        alert = summary.alerts[0]
+        self.assertEqual(alert["source_detail"], "path\\grass(hp).tc")
+        self.assertEqual(alert["size_bytes"], "228282")
+        self.assertEqual(alert["hashes"]["crc32"], "9b083404")
+
+    def test_server_imports_logiqx_dat_into_ufid_files(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"server-dat-import-{uuid.uuid4().hex}.sqlite"
+        self._create_test_user(db_path)
+        handler_class = type(
+            "TestUFIDDatImportRequestHandler",
+            (UFIDRequestHandler,),
+            {"db_path": db_path, "web_root": WEB_ROOT},
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        xml_dat = f"""<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>Server UFID DAT</name>
+  </header>
+  <game name="Server Set">
+    <rom name="server-dat.bin" size="9" crc="33333333" md5="{'d' * 32}" sha1="{'e' * 40}" />
+  </game>
+</datafile>
+"""
+
+        try:
+            token = self._login(base_url)
+            imported = self._post_json(
+                f"{base_url}/api/v1/files/import-dat",
+                {"filename": "server.dat", "text": xml_dat},
+                token=token,
+            )
+            files = self._get_json(
+                f"{base_url}/api/v1/files?q=server-dat.bin",
+                token=token,
+            )
+            alerts = self._get_json(
+                f"{base_url}/api/v1/goldrush/alerts?q=Server%20Set",
+                token=token,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(imported["source_name"], "Server UFID DAT")
+        self.assertEqual(imported["created"], 1)
+        self.assertEqual(imported["skipped"], 0)
+        self.assertEqual(files["total_count"], 1)
+        file_record = files["files"][0]
+        self.assertEqual(file_record["display_name"], "server-dat.bin")
+        self.assertEqual(file_record["description"], "Server Set")
+        self.assertEqual(
+            {
+                item["name"]: item["value"]
+                for item in file_record["metadata"]
+                if item["name"].startswith("dat_") or item["name"] == "source"
+            },
+            {
+                "source": "logiqx_dat",
+                "dat_source_type": "logiqx-dat-xml",
+                "dat_source_name": "Server UFID DAT",
+                "dat_set_name": "Server Set",
+                "dat_entry_name": "server-dat.bin",
+                "dat_filename": "server.dat",
+            },
+        )
+        self.assertEqual(alerts["total_count"], 0)
+
     def test_server_reports_optional_hash_conflict_payload(self) -> None:
         SCRATCH.mkdir(exist_ok=True)
         db_path = SCRATCH / f"server-conflict-{uuid.uuid4().hex}.sqlite"
@@ -498,7 +667,7 @@ game (
         handler_class = type(
             "TestUFIDConflictRequestHandler",
             (UFIDRequestHandler,),
-            {"db_path": db_path, "web_root": ROOT / "web"},
+            {"db_path": db_path, "web_root": WEB_ROOT},
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -559,7 +728,7 @@ game (
         handler_class = type(
             "TestUFIDAuthRequestHandler",
             (UFIDRequestHandler,),
-            {"db_path": db_path, "web_root": ROOT / "web"},
+            {"db_path": db_path, "web_root": WEB_ROOT},
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -588,7 +757,7 @@ game (
         handler_class = type(
             "TestUFIDUserLifecycleRequestHandler",
             (UFIDRequestHandler,),
-            {"db_path": db_path, "web_root": ROOT / "web"},
+            {"db_path": db_path, "web_root": WEB_ROOT},
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -748,7 +917,7 @@ game (
             (UFIDRequestHandler,),
             {
                 "db_path": db_path,
-                "web_root": ROOT / "web",
+                "web_root": WEB_ROOT,
                 "local_api_token": "local-secret-token",
             },
         )
@@ -808,7 +977,7 @@ game (
             (UFIDRequestHandler,),
             {
                 "db_path": db_path,
-                "web_root": ROOT / "web",
+                "web_root": WEB_ROOT,
                 "local_api_token": "local-cli-token",
             },
         )

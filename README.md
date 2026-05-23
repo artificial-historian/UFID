@@ -7,7 +7,7 @@ This repository currently contains runnable Python local applications that
 establish the core behavior and data model. The backend target is PostgreSQL,
 with SQLite available for local/offline use.
 
-Current release target: `0.8`.
+Current release target: `0.9 Alpha`.
 
 ## Components
 
@@ -16,14 +16,16 @@ Current release target: `0.8`.
 - `ufid-add`: compute hashes for a file or directory and insert or enrich UFID
   records. Supported archives are inspected and their file/directory contents
   are linked to the archive record, including nested archives.
+- `ufid-dat-import`: import full Logiqx DAT rows into UFID file identity
+  records, separate from Goldrush alert imports.
 - `ufid-auth`: create users directly in a UFID database, log in to an API, and
   persist CLI bearer sessions.
 - `ufid-ia-ingest`: discover Internet Archive item files, download and hash
   their bytes, add them to UFID, and inspect supported archive contents.
 - `ufid-server`: local HTTP API backed by SQLite for prototype use.
 - `ufid-pg-server`: HTTP API backed by PostgreSQL for deployment behind nginx.
-- `web/`: static browser interface with drag-and-drop client-side hashing,
-  known-file browsing, and Goldrush hash monitoring.
+- `src/ufid/web/`: packaged static browser interface with drag-and-drop
+  client-side hashing, known-file browsing, and Goldrush hash monitoring.
 - `docs/database.postgres.sql`: PostgreSQL schema for the backend target.
 
 ## Quick Start
@@ -34,6 +36,7 @@ Install the tools into your active Python environment:
 python -m pip install -e .
 ufid lookup .\some-file.bin
 ufid add .\some-file.bin --description "Sample file"
+ufid dat-import .\some-list.dat
 ufid server
 ```
 

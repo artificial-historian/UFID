@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: UFID API
-  version: 0.8
+  version: 0.9
 servers:
   - url: https://ufid.example.com
 paths:
@@ -152,6 +152,39 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ConflictError"
+  /api/v1/files/import-dat:
+    post:
+      summary: Import full Logiqx DAT rows into UFID file identities
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatImportRequest"
+      responses:
+        "200":
+          description: DAT imported with no newly created UFID records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileDatImportResult"
+        "201":
+          description: DAT imported with newly created UFID records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileDatImportResult"
+        "400":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: Identity conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictError"
   /api/v1/goldrush/alerts:
     get:
       summary: Browse the current user's Goldrush alert entries
@@ -285,7 +318,7 @@ paths:
                 $ref: "#/components/schemas/GoldrushAlertClearResult"
   /api/v1/goldrush/alert-sources:
     get:
-      summary: List the current user's Goldrush alert sources for match filtering
+      summary: List the current user's Goldrush alert lists for match filtering
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -304,6 +337,27 @@ paths:
                       $ref: "#/components/schemas/GoldrushAlertSource"
                   count:
                     type: integer
+  /api/v1/goldrush/ufid-sources:
+    get:
+      summary: List UFID source values available for match filtering
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: UFID source value list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources, count]
+                properties:
+                  sources:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GoldrushUfidSource"
+                  count:
+                    type: integer
   /api/v1/goldrush/matches:
     get:
       summary: List stored UFID matches for the current user's Goldrush alerts
@@ -317,7 +371,16 @@ paths:
             type: string
         - name: source_key
           in: query
-          description: Repeat to restrict matches to one or more alert sources.
+          description: Repeat to restrict matches to one or more alert lists.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: ufid_source
+          in: query
+          description: Repeat to restrict matches to one or more UFID source table values.
           schema:
             type: array
             items:
@@ -1097,11 +1160,11 @@ components:
           description: Number of alerts removed from the current user's set.
     GoldrushAlertSource:
       type: object
-      required: [source_key, label, alert_count]
+      required: [source_key, label, alert_count, hit_count]
       properties:
         source_key:
           type: string
-          description: Use `manual` for manual alerts; imported sources use `source_type|source_name`.
+          description: Use `manual` for manual alerts; imported alert lists use `source_type|source_name`.
         label:
           type: string
         source_type:
@@ -1114,7 +1177,20 @@ components:
             - "null"
         alert_count:
           type: integer
-    GoldrushImportRequest:
+        hit_count:
+          type: integer
+    GoldrushUfidSource:
+      type: object
+      required: [source_value, label, hit_count]
+      properties:
+        source_value:
+          type: string
+          description: Stored UFID source table name.
+        label:
+          type: string
+        hit_count:
+          type: integer
+    DatImportRequest:
       type: object
       required: [text]
       properties:
@@ -1124,6 +1200,40 @@ components:
             - "null"
         text:
           type: string
+    FileDatImportResult:
+      type: object
+      required: [source_name, parsed, received, valid, created, enriched, unchanged, skipped, errors]
+      properties:
+        source_name:
+          type: string
+        parsed:
+          type: integer
+        received:
+          type: integer
+        valid:
+          type: integer
+          description: Rows with enough exact identity data for a UFID file upsert attempt.
+        created:
+          type: integer
+        enriched:
+          type: integer
+        unchanged:
+          type: integer
+        skipped:
+          type: integer
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              name:
+                type: string
+              error:
+                type: string
+    GoldrushImportRequest:
+      $ref: "#/components/schemas/DatImportRequest"
     GoldrushImportResult:
       type: object
       required: [source_name, parsed, received, valid, created, skipped, errors]
@@ -1175,6 +1285,27 @@ components:
                 - "null"
             hashes:
               $ref: "#/components/schemas/HashSet"
+            source:
+              type:
+                - object
+                - "null"
+              properties:
+                source_file_id:
+                  type:
+                    - integer
+                    - "null"
+                source_value:
+                  type: string
+                label:
+                  type: string
+                description:
+                  type:
+                    - string
+                    - "null"
+                external_reference:
+                  type:
+                    - string
+                    - "null"
             internet_archive:
               type:
                 - object
@@ -1197,6 +1328,14 @@ components:
                     - string
                     - "null"
                 file_name:
+                  type:
+                    - string
+                    - "null"
+                file_source:
+                  type:
+                    - string
+                    - "null"
+                file_format:
                   type:
                     - string
                     - "null"

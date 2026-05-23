@@ -89,7 +89,7 @@ python3 -m venv /opt/ufid/venv
 Copy web assets:
 
 ```bash
-cp -r /opt/ufid/app/web/* /opt/ufid/web/
+cp -r /opt/ufid/app/src/ufid/web/* /opt/ufid/web/
 ```
 
 Create the service environment:
@@ -161,9 +161,10 @@ under `.ufid/sessions.json`. The lookup and add applications automatically use
 the saved token for the matching backend URL. You can also set
 `UFID_API_TOKEN` for non-interactive jobs.
 
-The browser UI uses relative `/api/v1/...` URLs, so serving `web/` from the same
-nginx hostname makes it work without exposing PostgreSQL or configuring CORS.
-Browser sessions use a Secure, HttpOnly `ufid_session` cookie.
+The browser UI uses relative `/api/v1/...` URLs. Copying the packaged
+`src/ufid/web/` assets into nginx's document root makes it work from the same
+hostname without exposing PostgreSQL or configuring CORS. Browser sessions use
+a Secure, HttpOnly `ufid_session` cookie.
 
 ## API Endpoints
 

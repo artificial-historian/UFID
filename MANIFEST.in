@@ -5,4 +5,3 @@ recursive-include deploy *.conf *.example *.service *.sql *.md
 recursive-include docs *.md *.sql *.yaml
 recursive-include scripts *.py *.ps1
 recursive-include src/ufid/web *.css *.html *.js *.svg
-recursive-include web *.css *.html *.js *.svg

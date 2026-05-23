@@ -36,7 +36,7 @@ from ufid.ia_client import (
     IAFile,
     IAHTTPClient,
     file_url,
-    is_metadata_file,
+    is_ia_artifact_file,
     parse_item_metadata,
     safe_download_path,
     verify_declared_fixity,
@@ -56,6 +56,8 @@ INGEST_MODES = ("all", "metadata", "download")
 DEFAULT_SCRAPE_FIELDS = ["identifier", "title", "mediatype", "collection"]
 REQUIRED_IA_IDENTITY_FIELDS = ("size", "crc32", "md5", "sha1")
 IA_METADATA_PREFIX = "org.archive-"
+IA_ARTIFACT_TAG = "IA Artefacts"
+IA_SOURCE_VALUE = "internet_archive"
 IA_ITEM_CONTAINER_FIELDS = {"metadata", "files"}
 PROMOTED_IA_FILE_FIELDS = {
     "name",
@@ -144,8 +146,6 @@ class IngestOptions:
     min_size_bytes: int | None
     max_size_bytes: int | None
     original_only: bool
-    skip_metadata_files: bool
-    ia_artifacts: bool
     keep_cache: bool
     retry_failed: bool
     dry_run: bool
@@ -862,21 +862,13 @@ class IAIngestRunner:
         download_identity_required = 0
         api_identity_available = 0
         queued_files = 0
-        skipped_ia_artifacts = 0
+        tagged_ia_artifacts = 0
         item_ufid_created = 0
         item_ufid_enriched = 0
         item_ufid_failed = 0
         for ia_file in item.files:
-            artifact_skip_reason = self._ia_artifact_skip_reason(ia_file)
-            if artifact_skip_reason:
-                self.stats.skipped_files += 1
-                skipped_ia_artifacts += 1
-                self._progress(
-                    "info",
-                    "file_skipped",
-                    f"Skipped IA file {identifier}/{ia_file.name}: {artifact_skip_reason}",
-                )
-                continue
+            if is_ia_artifact_file(ia_file):
+                tagged_ia_artifacts += 1
             missing_identity = missing_required_ia_identity(ia_file)
             if missing_identity:
                 download_identity_required += 1
@@ -969,7 +961,7 @@ class IAIngestRunner:
             f"Queued {queued_files} IA file(s) from metadata: {identifier}",
             api_identity_available=api_identity_available,
             download_identity_required=download_identity_required,
-            skipped_ia_artifacts=skipped_ia_artifacts,
+            ia_artifacts=tagged_ia_artifacts,
             ufid_created=item_ufid_created,
             ufid_enriched=item_ufid_enriched,
             ufid_failed=item_ufid_failed,
@@ -1074,6 +1066,7 @@ class IAIngestRunner:
             "done",
             ufid_file_id=file_id,
             downloaded_path=str(download.path),
+            size_bytes=hash_result.size_bytes,
             error=None,
         )
         self._progress(
@@ -1108,8 +1101,6 @@ class IAIngestRunner:
         reason = None
         if self.options.original_only and ia_file.source != "original":
             reason = "not original"
-        else:
-            reason = self._ia_artifact_skip_reason(ia_file)
         if reason is None and (
             self.options.max_file_bytes is not None
             and ia_file.size is not None
@@ -1132,13 +1123,6 @@ class IAIngestRunner:
             )
             return True
         return False
-
-    def _ia_artifact_skip_reason(self, ia_file: IAFile) -> str | None:
-        if self.options.ia_artifacts and not self.options.skip_metadata_files:
-            return None
-        if is_metadata_file(ia_file):
-            return "IA artifact file skipped"
-        return None
 
     def _should_defer_download(
         self,
@@ -1334,7 +1318,7 @@ def ia_metadata(
     item_metadata: Mapping[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     metadata = [
-        {"metadata_type": "text", "name": "source", "value": "internet_archive"},
+        {"metadata_type": "text", "name": "source", "value": IA_SOURCE_VALUE},
         {"metadata_type": "text", "name": "ia_identifier", "value": identifier},
         {"metadata_type": "text", "name": "ia_file_name", "value": ia_file.name},
         {
@@ -1348,6 +1332,14 @@ def ia_metadata(
             "value": file_url(identifier, ia_file.name),
         },
     ]
+    if is_ia_artifact_file(ia_file):
+        metadata.append(
+            {
+                "metadata_type": "text",
+                "name": "tag",
+                "value": IA_ARTIFACT_TAG,
+            }
+        )
     optional_values = {
         "ia_file_source": ia_file.source,
         "ia_file_format": ia_file.format,
@@ -1626,20 +1618,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--original-only", action="store_true")
-    parser.add_argument(
-        "--ia-artifacts",
-        action="store_true",
-        help=(
-            "Include Internet Archive-generated artifact files such as "
-            "*_files.xml, *_meta.sqlite, and *_meta.xml. These are skipped by "
-            "default."
-        ),
-    )
-    parser.add_argument(
-        "--skip-metadata-files",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument("--keep-cache", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -1727,8 +1705,6 @@ def options_from_args(args: argparse.Namespace) -> IngestOptions:
         min_size_bytes=args.min_size_bytes,
         max_size_bytes=args.max_size_bytes,
         original_only=bool(args.original_only),
-        skip_metadata_files=bool(args.skip_metadata_files),
-        ia_artifacts=bool(args.ia_artifacts),
         keep_cache=bool(args.keep_cache),
         retry_failed=bool(args.retry_failed),
         dry_run=bool(args.dry_run),

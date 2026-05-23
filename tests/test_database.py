@@ -25,6 +25,7 @@ from ufid.database import (
     complete_registration,
     connect,
     count_goldrush_alerts,
+    count_goldrush_matches,
     create_goldrush_alert,
     create_invited_user,
     create_session,
@@ -33,9 +34,11 @@ from ufid.database import (
     get_authenticated_user,
     get_registration_token,
     get_user_by_id,
+    import_dat_file_identities,
     list_user_removal_requests,
     list_files,
     list_goldrush_matches,
+    list_goldrush_ufid_sources,
     register_user,
     request_user_removal,
     revoke_session,
@@ -45,6 +48,7 @@ from ufid.database import (
     upsert_file_identity,
 )
 from ufid.auth import verify_password
+from ufid.goldrush import parse_logiqx_dat
 from ufid.paths import default_user_data_dir
 
 SCRATCH = default_user_data_dir() / "test-runs"
@@ -526,6 +530,95 @@ class DatabaseTests(unittest.TestCase):
                     hashes={"crc32": "12345678", "md5": "a" * 32},
                 )
 
+    def test_import_dat_file_identities_creates_ufid_records(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        db_path = SCRATCH / f"database-dat-import-{uuid.uuid4().hex}.sqlite"
+        summary = parse_logiqx_dat(
+            f"""<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>UFID DAT</name>
+  </header>
+  <game name="Complete Set">
+    <rom name="complete.bin" size="5" crc="11111111" md5="{'a' * 32}" sha1="{'b' * 40}" sha256="{'c' * 64}" />
+    <rom name="partial.bin" size="7" crc="22222222" />
+  </game>
+</datafile>
+"""
+        )
+        with closing(connect(db_path)) as connection:
+            user = create_user(
+                connection,
+                username="dat-import-user",
+                password="correct horse battery staple",
+                roles=["reader"],
+            )
+            result = import_dat_file_identities(
+                connection,
+                records=summary.alerts,
+                dat_filename="ufid.dat",
+            )
+            duplicate = import_dat_file_identities(
+                connection,
+                records=summary.alerts,
+                dat_filename="ufid.dat",
+            )
+            files = list_files(connection, query="complete.bin")
+            ufid_sources = list_goldrush_ufid_sources(
+                connection,
+                user_id=int(user["id"]),
+            )
+            source_links = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT s.name, s.description, fs.external_reference
+                    FROM ufid_file_source fs
+                    JOIN ufid_source s ON s.id = fs.source_id
+                    JOIN ufid_file f ON f.id = fs.file_id
+                    WHERE f.sha1 = ?
+                    ORDER BY s.name, fs.external_reference
+                    """,
+                    ("b" * 40,),
+                ).fetchall()
+            ]
+
+        self.assertEqual(result["received"], 2)
+        self.assertEqual(result["valid"], 1)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertIn("Required hashes are missing: md5, sha1", result["errors"][0]["error"])
+        self.assertEqual(duplicate["created"], 0)
+        self.assertEqual(duplicate["unchanged"], 1)
+        self.assertEqual(len(files), 1)
+        imported = files[0]
+        self.assertEqual(imported["display_name"], "complete.bin")
+        self.assertEqual(imported["description"], "Complete Set")
+        self.assertEqual(imported["hashes"]["sha256"], "c" * 64)
+        self.assertEqual(metadata_value(imported, "source"), "logiqx_dat")
+        self.assertEqual(metadata_value(imported, "dat_source_name"), "UFID DAT")
+        self.assertEqual(metadata_value(imported, "dat_filename"), "ufid.dat")
+        self.assertEqual(
+            ufid_sources,
+            [
+                {
+                    "source_value": "logiqx_dat",
+                    "label": "Logiqx DAT",
+                    "hit_count": 0,
+                }
+            ],
+        )
+        self.assertEqual(
+            source_links,
+            [
+                {
+                    "name": "logiqx_dat",
+                    "description": "Logiqx DAT",
+                    "external_reference": "ufid.dat",
+                }
+            ],
+        )
+
     def test_upsert_rejects_malformed_hash_values(self) -> None:
         SCRATCH.mkdir(exist_ok=True)
         db_path = SCRATCH / f"database-malformed-hash-{uuid.uuid4().hex}.sqlite"
@@ -667,6 +760,11 @@ class DatabaseTests(unittest.TestCase):
                 metadata=[
                     {
                         "metadata_type": "text",
+                        "name": "source",
+                        "value": "internet_archive",
+                    },
+                    {
+                        "metadata_type": "text",
                         "name": "ia_identifier",
                         "value": "ia-top-item",
                     },
@@ -684,6 +782,11 @@ class DatabaseTests(unittest.TestCase):
                         "metadata_type": "text",
                         "name": "ia_file_name",
                         "value": "ia-archive.zip",
+                    },
+                    {
+                        "metadata_type": "text",
+                        "name": "ia_file_format",
+                        "value": "ZIP",
                     },
                 ],
             )
@@ -717,6 +820,25 @@ class DatabaseTests(unittest.TestCase):
                 user_id=int(user["id"]),
             )
             matches = list_goldrush_matches(connection, user_id=int(user["id"]))
+            ia_source_matches = list_goldrush_matches(
+                connection,
+                user_id=int(user["id"]),
+                ufid_sources=["internet_archive"],
+            )
+            other_source_matches = list_goldrush_matches(
+                connection,
+                user_id=int(user["id"]),
+                ufid_sources=["manual_upload"],
+            )
+            ia_source_count = count_goldrush_matches(
+                connection,
+                user_id=int(user["id"]),
+                ufid_sources=["internet_archive"],
+            )
+            ufid_sources = list_goldrush_ufid_sources(
+                connection,
+                user_id=int(user["id"]),
+            )
             other_matches = list_goldrush_matches(
                 connection,
                 user_id=int(other_user["id"]),
@@ -726,7 +848,30 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(scan_result, {"matched": 1, "created": 1})
         self.assertEqual(duplicate_scan_result, {"matched": 1, "created": 0})
         self.assertEqual(len(matches), 1)
+        self.assertEqual(ia_source_matches, matches)
+        self.assertEqual(other_source_matches, [])
+        self.assertEqual(ia_source_count, 1)
+        self.assertEqual(
+            ufid_sources,
+            [
+                {
+                    "source_value": "internet_archive",
+                    "label": "Internet Archive",
+                    "hit_count": 1,
+                }
+            ],
+        )
         self.assertEqual(other_matches, [])
+        self.assertEqual(
+            matches[0]["file"]["source"],
+            {
+                "source_file_id": parent.file_id,
+                "source_value": "internet_archive",
+                "label": "Internet Archive",
+                "description": "Internet Archive",
+                "external_reference": "https://archive.org/download/ia-top-item/ia-archive.zip",
+            },
+        )
         internet_archive = matches[0]["file"]["internet_archive"]
         self.assertIsNotNone(internet_archive)
         assert internet_archive is not None
@@ -737,6 +882,7 @@ class DatabaseTests(unittest.TestCase):
             "https://archive.org/details/ia-top-item",
         )
         self.assertEqual(internet_archive["file_name"], "ia-archive.zip")
+        self.assertEqual(internet_archive["file_format"], "ZIP")
 
     def test_clear_goldrush_alerts_only_removes_current_user_rows(self) -> None:
         SCRATCH.mkdir(exist_ok=True)

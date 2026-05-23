@@ -74,7 +74,7 @@ def resolve_web_root(configured: str | Path | None = None) -> Path:
 
 
 def _web_root_candidates() -> list[Path]:
-    candidates = [source_root() / "web"]
+    candidates: list[Path] = []
     try:
         package_web = resources.files("ufid.web")
     except (ImportError, ModuleNotFoundError):

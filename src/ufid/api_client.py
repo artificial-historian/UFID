@@ -167,6 +167,23 @@ def add_file_metadata(
     )
 
 
+def import_dat_file_identities(
+    base_url: str,
+    *,
+    filename: str | None,
+    text: str,
+    timeout: float = 30,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    return _post_json(
+        f"{base_url.rstrip('/')}/api/v1/files/import-dat",
+        {"filename": filename, "text": text},
+        timeout=timeout,
+        base_url=base_url,
+        api_token=api_token,
+    )
+
+
 def _post_json(
     url: str,
     payload: Mapping[str, Any],

@@ -1,5 +1,5 @@
 const PAGE_LIMIT = 200;
-const HASH_COLUMNS = ["crc32", "md5", "sha1", "sha256", "blake3"];
+const HASH_COLUMNS = ["crc32", "md5", "sha1"];
 
 const state = {
   user: null,
@@ -15,6 +15,9 @@ const state = {
 };
 
 let filterTimer = null;
+let activeMetadataTrigger = null;
+let activeMetadataModalTrigger = null;
+let metadataHideTimer = null;
 
 const apiStatus = document.querySelector("#apiStatus");
 const fileFilter = document.querySelector("#fileFilter");
@@ -34,6 +37,34 @@ const refreshButton = document.querySelector("#refreshButton");
 const sessionPanel = document.querySelector("#sessionPanel");
 const sessionUser = document.querySelector("#sessionUser");
 const sortButtons = [...document.querySelectorAll("[data-sort]")];
+const metadataHoverPanel = document.createElement("div");
+metadataHoverPanel.id = "metadataHoverPanel";
+metadataHoverPanel.className = "metadata-hover-panel";
+metadataHoverPanel.hidden = true;
+metadataHoverPanel.setAttribute("role", "dialog");
+metadataHoverPanel.setAttribute("aria-label", "File metadata");
+document.body.append(metadataHoverPanel);
+const metadataModalBackdrop = document.createElement("div");
+metadataModalBackdrop.id = "metadataModalBackdrop";
+metadataModalBackdrop.className = "metadata-modal-backdrop";
+metadataModalBackdrop.hidden = true;
+metadataModalBackdrop.innerHTML = `
+  <section class="metadata-modal" role="dialog" aria-modal="true" aria-labelledby="metadataModalTitle">
+    <header class="metadata-modal-heading">
+      <div>
+        <h3 id="metadataModalTitle">File metadata</h3>
+        <p id="metadataModalSummary"></p>
+      </div>
+      <button id="metadataModalClose" class="metadata-modal-close" type="button" aria-label="Close metadata panel">X</button>
+    </header>
+    <div id="metadataModalBody" class="metadata-modal-body"></div>
+  </section>
+`;
+document.body.append(metadataModalBackdrop);
+const metadataModalBody = document.querySelector("#metadataModalBody");
+const metadataModalClose = document.querySelector("#metadataModalClose");
+const metadataModalSummary = document.querySelector("#metadataModalSummary");
+const metadataModalTitle = document.querySelector("#metadataModalTitle");
 
 checkApi();
 
@@ -73,6 +104,85 @@ pageNumberList.addEventListener("click", async (event) => {
     return;
   }
   await goToPage(Number(button.dataset.page || "1"));
+});
+
+filesTable.addEventListener("mouseover", (event) => {
+  const trigger = metadataTriggerFromEvent(event);
+  if (!trigger || (event.relatedTarget && trigger.contains(event.relatedTarget))) {
+    return;
+  }
+  showMetadataPanel(trigger);
+});
+
+filesTable.addEventListener("mouseout", (event) => {
+  const trigger = metadataTriggerFromEvent(event);
+  if (!trigger || (event.relatedTarget && trigger.contains(event.relatedTarget))) {
+    return;
+  }
+  scheduleHideMetadataPanel();
+});
+
+filesTable.addEventListener("focusin", (event) => {
+  const trigger = metadataTriggerFromEvent(event);
+  if (trigger) {
+    showMetadataPanel(trigger);
+  }
+});
+
+filesTable.addEventListener("focusout", (event) => {
+  const trigger = metadataTriggerFromEvent(event);
+  if (trigger) {
+    scheduleHideMetadataPanel();
+  }
+});
+
+filesTable.addEventListener("click", (event) => {
+  const trigger = metadataTriggerFromEvent(event);
+  if (!trigger) {
+    return;
+  }
+  event.preventDefault();
+  openMetadataModal(trigger);
+});
+
+metadataHoverPanel.addEventListener("mouseenter", () => {
+  window.clearTimeout(metadataHideTimer);
+});
+
+metadataHoverPanel.addEventListener("mouseleave", () => {
+  scheduleHideMetadataPanel();
+});
+
+metadataModalClose.addEventListener("click", () => {
+  closeMetadataModal();
+});
+
+metadataModalBackdrop.addEventListener("click", (event) => {
+  if (event.target === metadataModalBackdrop) {
+    closeMetadataModal();
+  }
+});
+
+window.addEventListener("scroll", () => {
+  if (!metadataHoverPanel.hidden && activeMetadataTrigger) {
+    positionMetadataPanel(activeMetadataTrigger);
+  }
+}, true);
+
+window.addEventListener("resize", () => {
+  if (!metadataHoverPanel.hidden && activeMetadataTrigger) {
+    positionMetadataPanel(activeMetadataTrigger);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    if (!metadataModalBackdrop.hidden) {
+      closeMetadataModal();
+    } else {
+      hideMetadataPanel();
+    }
+  }
 });
 
 async function goToPage(page) {
@@ -284,14 +394,297 @@ function renderFileRow(file) {
         ${file.content_type ? `<span>${escapeHtml(file.content_type)}</span>` : ""}
       </td>
       <td>${escapeHtml(formatBytes(file.size_bytes))}</td>
+      <td class="file-source">${renderSourceCell(file)}</td>
+      <td class="metadata-cell">${renderMetadataTrigger(file)}</td>
       ${HASH_COLUMNS.map((algorithm) => `<td class="hash-cell">${escapeHtml(hashes[algorithm] || "")}</td>`).join("")}
     </tr>
   `;
 }
 
+function renderSourceCell(file) {
+  const source = fileSourceSummary(file);
+  if (!source.label) {
+    return '<span class="empty-source">Unspecified</span>';
+  }
+  return `
+    <strong>${escapeHtml(source.label)}</strong>
+    ${source.detail ? `<span>${escapeHtml(source.detail)}</span>` : ""}
+  `;
+}
+
+function renderMetadataTrigger(file) {
+  const count = metadataRows(file).length;
+  if (!count) {
+    return '<span class="metadata-empty">None</span>';
+  }
+  return `
+    <a
+      class="metadata-link"
+      href="#"
+      data-metadata-file-id="${escapeHtml(file.id)}"
+      aria-describedby="metadataHoverPanel"
+      aria-haspopup="dialog"
+    >${count} ${count === 1 ? "row" : "rows"}</a>
+  `;
+}
+
 function renderFilesMessage(message) {
+  closeMetadataModal({ restoreFocus: false });
+  hideMetadataPanel();
   filesTable.innerHTML = `<tr><td colspan="8">${escapeHtml(message)}</td></tr>`;
   renderPagination();
+}
+
+function metadataTriggerFromEvent(event) {
+  const trigger = event.target?.closest?.("[data-metadata-file-id]");
+  if (!trigger || !filesTable.contains(trigger)) {
+    return null;
+  }
+  return trigger;
+}
+
+function showMetadataPanel(trigger) {
+  window.clearTimeout(metadataHideTimer);
+  const file = state.files.find((item) => String(item.id) === String(trigger.dataset.metadataFileId));
+  if (!file) {
+    hideMetadataPanel();
+    return;
+  }
+  activeMetadataTrigger = trigger;
+  metadataHoverPanel.innerHTML = renderMetadataPanel(file);
+  metadataHoverPanel.hidden = false;
+  positionMetadataPanel(trigger);
+}
+
+function scheduleHideMetadataPanel() {
+  window.clearTimeout(metadataHideTimer);
+  metadataHideTimer = window.setTimeout(hideMetadataPanel, 160);
+}
+
+function hideMetadataPanel() {
+  window.clearTimeout(metadataHideTimer);
+  metadataHoverPanel.hidden = true;
+  metadataHoverPanel.innerHTML = "";
+  activeMetadataTrigger = null;
+}
+
+function openMetadataModal(trigger) {
+  const file = state.files.find((item) => String(item.id) === String(trigger.dataset.metadataFileId));
+  if (!file) {
+    return;
+  }
+  hideMetadataPanel();
+  activeMetadataModalTrigger = trigger;
+  const metadata = metadataRows(file);
+  metadataModalTitle.textContent = file.display_name || `UFID ${file.id}`;
+  metadataModalSummary.textContent = `${metadata.length} ${metadata.length === 1 ? "metadata row" : "metadata rows"}`;
+  metadataModalBody.innerHTML = renderMetadataPanel(file, { large: true });
+  metadataModalBackdrop.hidden = false;
+  document.body.classList.add("metadata-modal-open");
+  metadataModalClose.focus();
+}
+
+function closeMetadataModal(options = {}) {
+  const { restoreFocus = true } = options;
+  if (metadataModalBackdrop.hidden) {
+    return;
+  }
+  metadataModalBackdrop.hidden = true;
+  metadataModalBody.innerHTML = "";
+  document.body.classList.remove("metadata-modal-open");
+  if (restoreFocus && activeMetadataModalTrigger?.isConnected) {
+    activeMetadataModalTrigger.focus();
+  }
+  activeMetadataModalTrigger = null;
+}
+
+function positionMetadataPanel(trigger) {
+  const panelWidth = Math.min(520, Math.max(260, window.innerWidth - 24));
+  metadataHoverPanel.style.width = `${panelWidth}px`;
+  const triggerRect = trigger.getBoundingClientRect();
+  const panelRect = metadataHoverPanel.getBoundingClientRect();
+  let left = triggerRect.left;
+  if (left + panelRect.width > window.innerWidth - 12) {
+    left = window.innerWidth - panelRect.width - 12;
+  }
+  left = Math.max(12, left);
+
+  let top = triggerRect.bottom + 8;
+  if (top + panelRect.height > window.innerHeight - 12) {
+    top = Math.max(12, triggerRect.top - panelRect.height - 8);
+  }
+
+  metadataHoverPanel.style.left = `${left}px`;
+  metadataHoverPanel.style.top = `${top}px`;
+}
+
+function renderMetadataPanel(file, options = {}) {
+  const metadata = metadataRows(file);
+  const listClass = options.large
+    ? "metadata-popover-list metadata-modal-list"
+    : "metadata-popover-list";
+  return `
+    ${
+      options.large
+        ? ""
+        : `
+          <div class="metadata-panel-heading">
+            <strong>${escapeHtml(file.display_name || `UFID ${file.id}`)}</strong>
+            <span>${metadata.length} ${metadata.length === 1 ? "metadata row" : "metadata rows"}</span>
+          </div>
+        `
+    }
+    ${
+      metadata.length
+        ? `<dl class="${listClass}">${metadata.map(renderMetadataRow).join("")}</dl>`
+        : '<p class="metadata-empty">No metadata rows.</p>'
+    }
+  `;
+}
+
+function renderMetadataRow(item) {
+  const name = item.name || "metadata";
+  const type = String(item.metadata_type || "text").toLowerCase();
+  const classType = type.replace(/[^a-z0-9_-]/g, "");
+  return `
+    <div class="metadata-popover-row metadata-row-${escapeHtml(classType || "text")}">
+      <dt>
+        ${escapeHtml(name)}
+        <span class="meta-type">${escapeHtml(type)}</span>
+      </dt>
+      <dd>
+        <div class="metadata-value">${renderMetadataValue(item)}</div>
+        ${item.notes ? `<span class="meta-notes">${escapeHtml(item.notes)}</span>` : ""}
+      </dd>
+    </div>
+  `;
+}
+
+function renderMetadataValue(item) {
+  const type = String(item.metadata_type || "text").toLowerCase();
+  const value = item.value == null ? "" : String(item.value);
+  if (!value) {
+    return "";
+  }
+  if (type === "url") {
+    return renderUrlMetadataValue(value);
+  }
+  if (type === "image") {
+    return renderImageMetadataValue(value);
+  }
+  if (type === "json") {
+    return renderJsonMetadataValue(value);
+  }
+  if (type === "number") {
+    const number = Number(value);
+    return Number.isFinite(number) ? escapeHtml(new Intl.NumberFormat().format(number)) : escapeHtml(value);
+  }
+  if (type === "date") {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? escapeHtml(value) : escapeHtml(date.toLocaleString());
+  }
+  if (type === "binary") {
+    return `<code>${escapeHtml(value)}</code>`;
+  }
+  return escapeHtml(value);
+}
+
+function renderUrlMetadataValue(value) {
+  const url = safeHttpUrl(value);
+  if (!url) {
+    return escapeHtml(value);
+  }
+  return `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(value)}</a>`;
+}
+
+function renderImageMetadataValue(value) {
+  const url = safeHttpUrl(value);
+  if (!url) {
+    return `<code>${escapeHtml(value)}</code>`;
+  }
+  return `
+    <a class="metadata-image-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">
+      <img class="metadata-image-preview" src="${escapeHtml(url)}" alt="">
+      <span>${escapeHtml(value)}</span>
+    </a>
+  `;
+}
+
+function renderJsonMetadataValue(value) {
+  try {
+    return `<pre>${escapeHtml(JSON.stringify(JSON.parse(value), null, 2))}</pre>`;
+  } catch {
+    return `<code>${escapeHtml(value)}</code>`;
+  }
+}
+
+function safeHttpUrl(value) {
+  const trimmed = String(value || "").trim();
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return "";
+  }
+  try {
+    const url = new URL(trimmed);
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function fileSourceSummary(file) {
+  const source = firstMetadataValue(file, "source");
+  const iaIdentifier = firstMetadataValue(file, "ia_identifier");
+  const iaFileName = firstMetadataValue(file, "ia_file_name");
+  const iaFileSource = firstMetadataValue(file, "ia_file_source");
+  const iaFormat = firstMetadataValue(file, "ia_file_format");
+  const archivePath = firstMetadataValue(file, "archive_path");
+  const datSourceName = firstMetadataValue(file, "dat_source_name");
+  const datEntryName = firstMetadataValue(file, "dat_entry_name");
+  if (source === "internet_archive" || iaIdentifier || iaFileName) {
+    const detail = [iaIdentifier, iaFormat || iaFileSource].filter(Boolean).join(" / ");
+    return {
+      label: "Internet Archive",
+      detail: detail || iaFileName || "",
+    };
+  }
+  if (source === "logiqx_dat" || datSourceName || datEntryName) {
+    return {
+      label: "Logiqx DAT",
+      detail: [datSourceName, datEntryName].filter(Boolean).join(" / "),
+    };
+  }
+  if (archivePath) {
+    return {
+      label: "Archive member",
+      detail: archivePath,
+    };
+  }
+  if (source) {
+    return {
+      label: source,
+      detail: "",
+    };
+  }
+  if (Array.isArray(file.archive_members) && file.archive_members.length) {
+    const count = file.archive_members.length;
+    return {
+      label: "Archive",
+      detail: `${count} ${count === 1 ? "member" : "members"}`,
+    };
+  }
+  return {
+    label: "Unspecified",
+    detail: "",
+  };
+}
+
+function firstMetadataValue(file, name) {
+  const row = metadataRows(file).find((item) => item.name === name);
+  return row && row.value != null ? String(row.value) : "";
+}
+
+function metadataRows(file) {
+  return Array.isArray(file.metadata) ? file.metadata : [];
 }
 
 function renderPagination() {

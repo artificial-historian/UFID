@@ -6,6 +6,7 @@ from ufid import __version__
 from ufid.add import main as add_main
 from ufid.archive_tools_setup import main as archive_tools_main
 from ufid.auth_cli import main as auth_main
+from ufid.dat_import import main as dat_import_main
 from ufid.ia_ingest import main as ia_ingest_main
 from ufid.local_ia_discovery import main as local_ia_discovery_main
 from ufid.lookup import main as lookup_main
@@ -17,6 +18,7 @@ COMMANDS = {
     "add": add_main,
     "archive-tools": archive_tools_main,
     "auth": auth_main,
+    "dat-import": dat_import_main,
     "ia-ingest": ia_ingest_main,
     "local-ia-discovery": local_ia_discovery_main,
     "lookup": lookup_main,

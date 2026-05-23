@@ -573,6 +573,7 @@ class IAIngestState:
         *,
         ufid_file_id: int | None = None,
         downloaded_path: str | None = None,
+        size_bytes: int | None = None,
         error: str | None = None,
         increment_attempts: bool = False,
     ) -> None:
@@ -584,6 +585,7 @@ class IAIngestState:
                 SET status = ?,
                     ufid_file_id = COALESCE(?, ufid_file_id),
                     downloaded_path = COALESCE(?, downloaded_path),
+                    size_bytes = COALESCE(?, size_bytes),
                     error = ?,
                     attempts = attempts + ?,
                     updated_at = ?
@@ -594,6 +596,7 @@ class IAIngestState:
                     status,
                     ufid_file_id,
                     downloaded_path,
+                    size_bytes,
                     error,
                     1 if increment_attempts else 0,
                     now,

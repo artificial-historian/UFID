@@ -43,9 +43,11 @@ from ufid.database import (
     get_user_removal_request_by_id,
     list_user_removal_requests,
     list_users,
+    import_dat_file_identities,
     import_goldrush_alerts,
     list_goldrush_alerts,
     list_goldrush_alert_sources,
+    list_goldrush_ufid_sources,
     list_files,
     list_goldrush_matches,
     register_user,
@@ -140,6 +142,11 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
                 return
             self._handle_list_goldrush_alert_sources()
             return
+        if parsed.path == "/api/v1/goldrush/ufid-sources":
+            if not self._require_role("reader"):
+                return
+            self._handle_list_goldrush_ufid_sources()
+            return
         if parsed.path == "/api/v1/goldrush/matches":
             if not self._require_role("reader"):
                 return
@@ -214,6 +221,11 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             if not self._require_role("contributor"):
                 return
             self._handle_upsert_file()
+            return
+        if parsed.path == "/api/v1/files/import-dat":
+            if not self._require_role("contributor"):
+                return
+            self._handle_import_file_dat()
             return
         if parsed.path == "/api/v1/goldrush/alerts":
             if not self._require_role("contributor"):
@@ -755,6 +767,14 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             sources = list_goldrush_alert_sources(connection, user_id=user_id)
         self._write_json({"sources": sources, "count": len(sources)})
 
+    def _handle_list_goldrush_ufid_sources(self) -> None:
+        user_id = self._registered_user_id()
+        if user_id is None:
+            return
+        with self._connect() as connection:
+            sources = list_goldrush_ufid_sources(connection, user_id=user_id)
+        self._write_json({"sources": sources, "count": len(sources)})
+
     def _handle_list_goldrush_matches(self, query: str) -> None:
         user_id = self._registered_user_id()
         if user_id is None:
@@ -773,6 +793,11 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             for value in params.get("source_key", [])
             if value.strip()
         )
+        ufid_sources = tuple(
+            value.strip()
+            for value in params.get("ufid_source", [])
+            if value.strip()
+        )
         with self._connect() as connection:
             matches = list_goldrush_matches(
                 connection,
@@ -781,12 +806,14 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
                 offset=offset,
                 query=search,
                 source_keys=source_keys,
+                ufid_sources=ufid_sources,
             )
             total_count = count_goldrush_matches(
                 connection,
                 user_id=user_id,
                 query=search,
                 source_keys=source_keys,
+                ufid_sources=ufid_sources,
             )
         self._write_json(
             {
@@ -857,6 +884,38 @@ class UFIDRequestHandler(SimpleHTTPRequestHandler):
             },
             status=HTTPStatus.CREATED if result.created else HTTPStatus.OK,
         )
+
+    def _handle_import_file_dat(self) -> None:
+        try:
+            payload = self._read_json()
+            dat_text = payload.get("text") or payload.get("content") or payload.get("dat")
+            if not isinstance(dat_text, str) or not dat_text.strip():
+                raise ValueError("text is required")
+            filename = payload.get("filename") or payload.get("name")
+            filename = None if filename is None else str(filename)
+            parsed = parse_logiqx_dat(dat_text, filename=filename)
+            with self._connect() as connection:
+                result = import_dat_file_identities(
+                    connection,
+                    records=parsed.alerts,
+                    dat_filename=filename,
+                )
+        except sqlite3.IntegrityError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        response = {
+            "source_name": parsed.source_name,
+            "parsed": len(parsed.alerts),
+            **result,
+        }
+        status = HTTPStatus.CREATED if result["created"] else HTTPStatus.OK
+        if result["valid"] == 0 and result["errors"]:
+            status = HTTPStatus.BAD_REQUEST
+        self._write_json(response, status=status)
 
     def _handle_goldrush_alerts_post(self) -> None:
         try:

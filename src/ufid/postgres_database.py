@@ -15,9 +15,12 @@ from ufid.database import (
     IdentityConflict,
     UpsertResult,
     _derived_metadata_fields,
+    _dat_file_identity_payload,
+    _dat_record_name,
     _goldrush_alert_row,
     _goldrush_alert_source_key_sql,
     _goldrush_alert_source_row,
+    _goldrush_ufid_source_row,
     _goldrush_match_cte_sql,
     _goldrush_match_row,
     _stored_goldrush_match_cte_sql,
@@ -25,8 +28,11 @@ from ufid.database import (
     _metadata_entries,
     _normalize_goldrush_alert,
     _normalize_goldrush_source_keys,
+    _normalize_ufid_sources,
     _normalize_roles,
     _normalize_username,
+    _optional_text,
+    _source_entries_from_metadata,
     _validate_required_identity,
     normalize_hashes,
 )
@@ -1164,6 +1170,8 @@ def upsert_file_identity(
         for item in metadata_entries:
             if _insert_metadata_if_new(connection, file_id, item):
                 enriched = not created or enriched
+        if _upsert_file_sources_from_metadata(connection, file_id, metadata_entries):
+            enriched = not created or enriched
 
     if deferred_conflict is not None:
         raise deferred_conflict
@@ -1221,7 +1229,66 @@ def add_file_metadata(
         for item in metadata_entries:
             if _insert_metadata_if_new(connection, file_id, item):
                 enriched = True
+        if _upsert_file_sources_from_metadata(connection, file_id, metadata_entries):
+            enriched = True
     return enriched
+
+
+def import_dat_file_identities(
+    connection,
+    *,
+    records: Iterable[Mapping[str, Any]],
+    dat_filename: str | None = None,
+) -> dict[str, Any]:
+    received = list(records)
+    normalized_rows: list[tuple[int, dict[str, Any]]] = []
+    errors: list[dict[str, Any]] = []
+    for index, record in enumerate(received):
+        try:
+            normalized_rows.append(
+                (
+                    index,
+                    _dat_file_identity_payload(record, dat_filename=dat_filename),
+                )
+            )
+        except ValueError as exc:
+            errors.append(
+                {
+                    "index": index,
+                    "name": _dat_record_name(record),
+                    "error": str(exc),
+                }
+            )
+
+    created = 0
+    enriched = 0
+    unchanged = 0
+    for index, row in normalized_rows:
+        try:
+            result = upsert_file_identity(connection, **row)
+        except (IdentityConflict, ValueError) as exc:
+            errors.append(
+                {
+                    "index": index,
+                    "name": _dat_record_name(received[index]),
+                    "error": str(exc),
+                }
+            )
+            continue
+        created += int(result.created)
+        enriched += int(not result.created and result.enriched)
+        unchanged += int(not result.created and not result.enriched)
+
+    skipped = len(received) - created - enriched - unchanged
+    return {
+        "received": len(received),
+        "valid": len(normalized_rows),
+        "created": created,
+        "enriched": enriched,
+        "unchanged": unchanged,
+        "skipped": skipped,
+        "errors": errors,
+    }
 
 
 def create_goldrush_alert(
@@ -1382,6 +1449,7 @@ def list_goldrush_alert_sources(connection, *, user_id: int) -> list[dict[str, A
             f"""
             WITH goldrush_alert_source AS (
                 SELECT
+                    a.id AS alert_id,
                     {_goldrush_alert_source_key_sql()} AS source_key,
                     CASE
                         WHEN COALESCE(a.source_type, '') = ''
@@ -1400,17 +1468,94 @@ def list_goldrush_alert_sources(connection, *, user_id: int) -> list[dict[str, A
                 label,
                 source_type,
                 source_name,
-                COUNT(*) AS alert_count
-            FROM goldrush_alert_source
+                COUNT(DISTINCT gas.alert_id) AS alert_count,
+                COUNT(um.file_id) AS hit_count
+            FROM goldrush_alert_source gas
+            LEFT JOIN ufid_goldrush_user_match um
+                   ON um.user_id = %s
+                  AND um.alert_id = gas.alert_id
             GROUP BY source_key, label, source_type, source_name
             ORDER BY
                 CASE WHEN source_key = 'manual' THEN 0 ELSE 1 END,
                 lower(label),
                 source_key
             """,
-            (user_id,),
+            (user_id, user_id),
         )
         return [_goldrush_alert_source_row(row) for row in cursor.fetchall()]
+
+
+def list_goldrush_ufid_sources(connection, *, user_id: int) -> list[dict[str, Any]]:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            WITH RECURSIVE user_match(row_key, file_id) AS (
+                SELECT alert_id::text || ':' || file_id::text, file_id
+                FROM ufid_goldrush_user_match
+                WHERE user_id = %s
+            ),
+            source_ancestor(row_key, file_id, ancestor_file_id, depth) AS (
+                SELECT row_key, file_id, file_id, 0
+                FROM user_match
+
+                UNION ALL
+
+                SELECT
+                    sa.row_key,
+                    sa.file_id,
+                    am.parent_file_id,
+                    sa.depth + 1
+                FROM source_ancestor sa
+                JOIN ufid_archive_member am
+                  ON am.child_file_id = sa.ancestor_file_id
+                WHERE sa.depth < 128
+            ),
+            source_catalog AS (
+                SELECT trim(name) AS source_value
+                FROM ufid_source
+                WHERE trim(name) <> ''
+
+                UNION
+
+                SELECT trim(value) AS source_value
+                FROM ufid_file_meta
+                WHERE name = 'source'
+                  AND trim(value) <> ''
+            ),
+            source_value AS (
+                SELECT fs.file_id, trim(s.name) AS source_value
+                FROM ufid_file_source fs
+                JOIN ufid_source s ON s.id = fs.source_id
+                WHERE trim(s.name) <> ''
+
+                UNION
+
+                SELECT fm.file_id, trim(fm.value) AS source_value
+                FROM ufid_file_meta fm
+                WHERE fm.name = 'source'
+                  AND trim(fm.value) <> ''
+            ),
+            source_hit AS (
+                SELECT
+                    sv.source_value,
+                    COUNT(DISTINCT sa.row_key) AS hit_count
+                FROM source_ancestor sa
+                JOIN source_value sv
+                  ON sv.file_id = sa.ancestor_file_id
+                GROUP BY sv.source_value
+            )
+            SELECT
+                sc.source_value,
+                COALESCE(sh.hit_count, 0) AS hit_count
+            FROM source_catalog sc
+            LEFT JOIN source_hit sh ON sh.source_value = sc.source_value
+            ORDER BY
+                CASE WHEN sc.source_value = 'internet_archive' THEN 0 ELSE 1 END,
+                lower(sc.source_value)
+            """,
+            (user_id,),
+        )
+        return [_goldrush_ufid_source_row(row) for row in cursor.fetchall()]
 
 
 def scan_goldrush_matches(connection, *, user_id: int) -> dict[str, int]:
@@ -1507,14 +1652,24 @@ def list_goldrush_matches(
     offset: int = 0,
     query: str | None = None,
     source_keys: Sequence[str] | None = None,
+    ufid_sources: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     bounded_limit = min(max(limit, 1), 200)
     bounded_offset = max(offset, 0)
-    filter_sql, params = _goldrush_match_filter(query, source_keys=source_keys)
+    normalized_ufid_sources = _normalize_ufid_sources(ufid_sources)
+    filter_sql, params = _goldrush_match_filter(
+        query,
+        source_keys=source_keys,
+        ufid_sources=normalized_ufid_sources,
+    )
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
-            {_stored_goldrush_match_cte_sql(include_sources=True, user_placeholder="%s")}
+            {_stored_goldrush_match_cte_sql(
+                include_sources=True,
+                include_ufid_sources=bool(normalized_ufid_sources),
+                user_placeholder="%s",
+            )}
             SELECT
                 a.id AS alert_id,
                 a.name AS alert_name,
@@ -1559,11 +1714,17 @@ def list_goldrush_matches(
                 m.matched_blake3,
                 m.size_matched,
                 m.found_at AS match_found_at,
-                s.source_file_id,
-                s.ia_identifier,
-                s.ia_item_url,
-                s.ia_file_url,
-                s.ia_file_name
+                fs.source_file_id AS ufid_source_file_id,
+                fs.source_value AS ufid_source_value,
+                fs.source_description AS ufid_source_description,
+                fs.external_reference AS ufid_source_external_reference,
+                ias.source_file_id,
+                ias.ia_identifier,
+                ias.ia_item_url,
+                ias.ia_file_url,
+                ias.ia_file_name,
+                ias.ia_file_source,
+                ias.ia_file_format
             {_goldrush_match_from_sql(include_sources=True)}
             {filter_sql}
             ORDER BY m.found_at DESC, a.id DESC, f.id DESC
@@ -1580,12 +1741,21 @@ def count_goldrush_matches(
     user_id: int,
     query: str | None = None,
     source_keys: Sequence[str] | None = None,
+    ufid_sources: Sequence[str] | None = None,
 ) -> int:
-    filter_sql, params = _goldrush_match_filter(query, source_keys=source_keys)
+    normalized_ufid_sources = _normalize_ufid_sources(ufid_sources)
+    filter_sql, params = _goldrush_match_filter(
+        query,
+        source_keys=source_keys,
+        ufid_sources=normalized_ufid_sources,
+    )
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
-            {_stored_goldrush_match_cte_sql(user_placeholder="%s")}
+            {_stored_goldrush_match_cte_sql(
+                include_ufid_sources=bool(normalized_ufid_sources),
+                user_placeholder="%s",
+            )}
             SELECT COUNT(*) AS total
             {_goldrush_match_from_sql()}
             {filter_sql}
@@ -1800,6 +1970,47 @@ def _insert_metadata_if_new(
         return cursor.fetchone() is not None
 
 
+def _upsert_file_sources_from_metadata(
+    connection,
+    file_id: int,
+    metadata_entries: Sequence[Mapping[str, str | None]],
+) -> bool:
+    enriched = False
+    for source in _source_entries_from_metadata(metadata_entries):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO ufid_source (name, description)
+                VALUES (%s, %s)
+                ON CONFLICT (name) DO UPDATE
+                SET description = COALESCE(ufid_source.description, EXCLUDED.description)
+                RETURNING id
+                """,
+                (source["source_value"], source["description"]),
+            )
+            source_id = int(cursor.fetchone()["id"])
+            cursor.execute(
+                """
+                INSERT INTO ufid_file_source (
+                    file_id,
+                    source_id,
+                    external_reference
+                )
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING file_id
+                """,
+                (
+                    file_id,
+                    source_id,
+                    source["external_reference"],
+                ),
+            )
+            if cursor.fetchone() is not None:
+                enriched = True
+    return enriched
+
+
 def _file_list_sort(sort_by: str, sort_direction: str) -> tuple[str, str]:
     key = (sort_by or "id").strip().lower()
     if key not in POSTGRES_FILE_LIST_SORT_COLUMNS:
@@ -1951,7 +2162,10 @@ def _goldrush_alert_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
 
 def _goldrush_match_from_sql(*, include_sources: bool = False) -> str:
     source_join = (
-        "LEFT JOIN goldrush_match_ia_source s ON s.file_id = f.id"
+        """
+        LEFT JOIN goldrush_match_ia_source ias ON ias.file_id = f.id
+        LEFT JOIN goldrush_match_source fs ON fs.file_id = f.id
+        """
         if include_sources
         else ""
     )
@@ -1968,6 +2182,7 @@ def _goldrush_match_filter(
     query: str | None,
     *,
     source_keys: Sequence[str] | None = None,
+    ufid_sources: Sequence[str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     clauses: list[str] = []
     params: list[str] = []
@@ -2013,6 +2228,25 @@ def _goldrush_match_filter(
         placeholders = ", ".join("%s" for _ in normalized_source_keys)
         clauses.append(f"{_goldrush_alert_source_key_sql()} IN ({placeholders})")
         params.extend(normalized_source_keys)
+
+    normalized_ufid_sources = _normalize_ufid_sources(ufid_sources)
+    if normalized_ufid_sources:
+        placeholders = ", ".join("%s" for _ in normalized_ufid_sources)
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM goldrush_match_ufid_source us
+                WHERE us.file_id = f.id
+                  AND us.source_value IN (
+            """
+            + placeholders
+            + """
+                  )
+            )
+            """
+        )
+        params.extend(normalized_ufid_sources)
 
     if not clauses:
         return "", ()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ufid-reference"
-version = "0.8"
+version = "0.9"
 description = "Reference implementation for the Universal File Identity Database"
 requires-python = ">=3.12,<3.15"
 dependencies = []
@@ -25,6 +25,7 @@ ufid = "ufid.cli:main"
 ufid-lookup = "ufid.lookup:main"
 ufid-add = "ufid.add:main"
 ufid-auth = "ufid.auth_cli:main"
+ufid-dat-import = "ufid.dat_import:main"
 ufid-ia-ingest = "ufid.ia_ingest:main"
 ufid-server = "ufid.server:main"
 ufid-pg-server = "ufid.pg_server:main"
